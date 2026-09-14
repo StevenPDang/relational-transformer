@@ -42,7 +42,7 @@ testpaths = ["tests"]
 
 [tool.pixi.workspace]
 channels = ["conda-forge"]
-platforms = ["linux-64"]
+platforms = ["linux-64", "osx-arm64"]
 
 [tool.pixi.dependencies]
 # 3.12 only: strictfire imports the stdlib `pipes` module, removed in 3.13
@@ -55,7 +55,7 @@ matplotlib = ">=3.11.0,<4"
 
 [tool.pixi.pypi-dependencies]
 relational-transformer = { path = ".", editable = true }
-torch = { version = "==2.6.0", index = "https://download.pytorch.org/whl/cu124" }
+torch = "*"
 safetensors = "*"
 sentence-transformers = "*"
 huggingface-hub = "*"
