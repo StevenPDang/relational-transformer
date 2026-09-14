@@ -55,7 +55,7 @@ matplotlib = ">=3.11.0,<4"
 
 [tool.pixi.pypi-dependencies]
 relational-transformer = { path = ".", editable = true }
-torch = "*"
+torch = { version = "==2.6.0", index = "https://download.pytorch.org/whl/cu124" }
 safetensors = "*"
 sentence-transformers = "*"
 huggingface-hub = "*"
