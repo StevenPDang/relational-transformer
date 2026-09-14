@@ -6,8 +6,8 @@ those tables into a persistent DuckDB file:
 
 ```bash
 pixi run import-duckdb \
-  --dataset stanford-star/relbench/rel-f1 \
-  --output rel-f1.duckdb
+  --dataset stanford-star/relbench/rel-amazon \
+  --output rel-amazon.duckdb
 ```
 
 `--dataset` also accepts a local directory containing `manifest.yaml` and

@@ -3,7 +3,7 @@
 Run from the repository root::
 
     pixi run import-duckdb \
-      --dataset stanford-star/relbench/rel-f1 --output rel-f1.duckdb
+      --dataset stanford-star/relbench/rel-amzaon --output rel-amazon.duckdb
 
 ``--dataset`` can also be a local RelBench-format directory containing
 ``manifest.yaml`` and ``db/*.parquet``.
