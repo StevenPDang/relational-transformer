@@ -70,6 +70,7 @@ einops = "*"
 scikit-learn = "<1.6.0"
 pandas = "*"
 pyarrow = "*"
+duckdb = "*"
 polars = "*"
 pytest = "*"
 lazy_loader = "*"
@@ -92,6 +93,7 @@ preprocess = { cmd = "python scripts/preprocess.py one", depends-on = ["build-sa
 preprocess-many = { cmd = "python scripts/preprocess.py many", depends-on = ["build-sampler"] }
 # Upload an already-preprocessed dataset directory to a HuggingFace repo.
 upload = "python scripts/preprocess.py upload"
+import-duckdb = "python -m scripts.import_relbench_duckdb"
 # Context visualizer (serves an HTTP UI over preprocessed data).
 ctx-viz = { cmd = "python scripts/ctx_viz.py", depends-on = ["build-sampler"] }
 pretrain = { cmd = "torchrun --standalone --nproc-per-node=auto scripts/pretrain.py", depends-on = ["build-sampler"] }

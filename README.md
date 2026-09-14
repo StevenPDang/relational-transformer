@@ -113,6 +113,7 @@ pixi run test        # or pretrain, eval, preprocess, ...
 | Guide | Description |
 |---|---|
 | [Downloads](docs/downloads.md) | Bulk-download raw data, preprocessed data, and checkpoints from HuggingFace |
+| [DuckDB import](docs/duckdb.md) | Copy raw RelBench Parquet tables into a persistent DuckDB database |
 | [Preprocess](docs/preprocess.md) | Convert RelBench-format databases into RT's on-disk format |
 | [Inference](docs/inference.md) | Run a trained checkpoint; evaluate, engineer, tune, and ensemble contexts |
 | [Pretrain](docs/pretrain.md) | Train RT from scratch, single-GPU to multi-node |
