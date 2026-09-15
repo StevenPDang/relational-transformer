@@ -1,5 +1,5 @@
 import duckdb
-con = duckdb.connect("rel-amazon", read_only=True)
+con = duckdb.connect("rel-amazon.duckdb", read_only=True)
 
 reviews = con.execute("""
     SELECT review_id, review_time, rating
