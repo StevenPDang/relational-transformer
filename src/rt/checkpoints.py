@@ -80,17 +80,29 @@ def resolve_checkpoint(
     if p.is_dir():
         d = p / subfolder if subfolder else p
     else:
-        from huggingface_hub import snapshot_download
+        from huggingface_hub import hf_hub_download
 
         repo_id, subdir = resolve_repo(spec)
         subdir = "/".join(part for part in (subdir, subfolder) if part)
-        local = snapshot_download(
-            repo_id=repo_id,
-            revision=revision,
-            allow_patterns=[f"{subdir}/*"] if subdir else None,
-            **_HF_UA,
+        prefix = f"{subdir}/" if subdir else ""
+        config_path = Path(
+            hf_hub_download(
+                repo_id=repo_id,
+                filename=f"{prefix}{CONFIG_FILE}",
+                revision=revision,
+                **_HF_UA,
+            )
         )
-        d = Path(local) / subdir if subdir else Path(local)
+        config = json.loads(config_path.read_text())
+        model_path = Path(
+            hf_hub_download(
+                repo_id=repo_id,
+                filename=f"{prefix}{config.get('checkpoint_file', MODEL_FILE)}",
+                revision=revision,
+                **_HF_UA,
+            )
+        )
+        return config, model_path
     config = json.loads((d / CONFIG_FILE).read_text())
     return config, d / config.get("checkpoint_file", MODEL_FILE)
 
