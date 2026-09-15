@@ -25,7 +25,7 @@ DB_NAME = "mini-shop"
 # Postgres : "postgresql+psycopg2://user:password@host:5432/dbname"
 # MySQL    : "mysql+pymysql://user:password@host:3306/dbname"
 # (install psycopg2-binary / pymysql for Postgres / MySQL.)
-SQL_URI = str(_HERE.parent[1] / "rel-amazon.duckdb")
+SQL_URI = str(_HERE.parents[1] / "rel-amazon.duckdb")
 
 # --- your relational schema ---------------------------------------------------
 # One entry per table you want to include. For each:
