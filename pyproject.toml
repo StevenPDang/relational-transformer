@@ -53,9 +53,14 @@ maturin = "*"
 uv = "*"
 matplotlib = ">=3.11.0,<4"
 
+[tool.pixi.feature.cuda124.pypi-dependencies]
+torch = { version = "==2.6.0", index = "https://download.pytorch.org/whl/cu124" }
+
+[tool.pixi.environments]
+cuda124 = ["cuda124"]
+
 [tool.pixi.pypi-dependencies]
 relational-transformer = { path = ".", editable = true }
-torch = "*"
 safetensors = "*"
 sentence-transformers = "*"
 huggingface-hub = "*"
