@@ -36,6 +36,7 @@ TABLES = {
     "customer": {"pkey": "customer_id"},
     "product": {"pkey": "product_id"},
     "review": {
+        "pkey": "review_id",
         "time_col": "review_time",
         "fkeys": {"customer_id": "customer", "product_id": "product"},
     },
