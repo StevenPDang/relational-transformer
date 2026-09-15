@@ -25,7 +25,7 @@ DB_NAME = "mini-shop"
 # Postgres : "postgresql+psycopg2://user:password@host:5432/dbname"
 # MySQL    : "mysql+pymysql://user:password@host:3306/dbname"
 # (install psycopg2-binary / pymysql for Postgres / MySQL.)
-SQL_URI = str(_HERE.parent / "byod" / "mini-shop.duckdb")
+SQL_URI = str(_HERE.parent / "rel-amazon.duckdb")
 
 # --- your relational schema ---------------------------------------------------
 # One entry per table you want to include. For each:
@@ -33,12 +33,11 @@ SQL_URI = str(_HERE.parent / "byod" / "mini-shop.duckdb")
 #   time_col : the row-timestamp column (omit if the table has no time)
 #   fkeys    : {foreign_key_column: table_it_points_to}
 TABLES = {
-    "customers": {"pkey": "customer_id"},
-    "products": {"pkey": "product_id"},
-    "transactions": {
-        "pkey": "transaction_id",
-        "time_col": "timestamp",
-        "fkeys": {"customer_id": "customers", "product_id": "products"},
+    "customer": {"pkey": "customer_id"},
+    "product": {"pkey": "product_id"},
+    "review": {
+        "time_col": "review_time",
+        "fkeys": {"customer_id": "customer", "product_id": "product"},
     },
 }
 
@@ -48,16 +47,16 @@ TABLES = {
 # column, and the target column (parquet or csv). `test` is required; `train`
 # is also used for regression target de-normalization.
 TASK = {
-    "name": "customer-churn",
-    "entity_table": "customers",
-    "entity_col": "customer_id",
-    "time_col": "timestamp",
-    "target_col": "churn",
-    "task_type": "binary_classification",  # or "regression"
+    "name": "review-rating",
+    "entity_table": "review",
+    "entity_col": "review_id",
+    "time_col": "review_time",
+    "target_col": "rating",
+    "task_type": "regression",  # or "regression"
     "splits": {
-        "train": str(DATA_DIR / "labels" / "churn_train.parquet"),
-        "val": str(DATA_DIR / "labels" / "churn_val.parquet"),
-        "test": str(DATA_DIR / "labels" / "churn_test.parquet"),
+        "train": str(DATA_DIR / "labels" / "review_rating_train.parquet"),
+        "val": str(DATA_DIR / "labels" / "review_rating_val.parquet"),
+        "test": str(DATA_DIR / "labels" / "review_rating_test.parquet"),
     },
 }
 
@@ -70,4 +69,4 @@ TASK = {
 #   "~/ckpts/my-run/best_clf.safetensors"     # your own training run
 #
 # Browse https://huggingface.co/stanford-star for all released checkpoints.
-CHECKPOINT = "stanford-star/rt-j/classification"
+CHECKPOINT = "stanford-star/rt-j/regression"
