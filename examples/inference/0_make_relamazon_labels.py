@@ -1,12 +1,22 @@
 import duckdb
 con = duckdb.connect("rel-amazon.duckdb", read_only=True)
 
+# create review_id PK over review table rows
+con.execute("""
+    CREATE OR REPLACE TABLE review AS
+    SELECT
+    row_number() OVER (
+        ORDER BY review_time, customer_id, product_id
+    ) - 1 AS review_id,
+    *
+    FROM review;
+    """)
 reviews = con.execute("""
     SELECT review_id, review_time, rating
     FROM review
     WHERE rating IS NOT NULL
     ORDER BY review_time
-""").df()
+    """).df()
 
 n = len(reviews)
 train = reviews.iloc[: int(n*0.8)]
