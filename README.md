@@ -119,3 +119,13 @@ pixi run test        # or pretrain, eval, preprocess, ...
 | [Pretrain](docs/pretrain.md) | Train RT from scratch, single-GPU to multi-node |
 | [Baselines](docs/baselines.md) | rel2tab tabular baselines through the same eval path |
 | [Context visualization](docs/context-visualization.md) | Inspect the contexts sampled for each row |
+
+## environments
+
+MacBook
+pixi install --environment mac
+pixi run --environment mac python ...
+
+Linux GPU server
+pixi install --environment cuda124
+pixi run --environment cuda124 python examples/inference/3_predict.py
