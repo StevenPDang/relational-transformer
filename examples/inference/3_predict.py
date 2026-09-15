@@ -43,6 +43,11 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", default=config.CHECKPOINT,
                    help="Hub spec or local path; overrides config.CHECKPOINT")
+    p.add_argument(
+        "--checkpoint-revision",
+        default=config.CHECKPOINT_REVISION,
+        help="Hub branch, tag, or commit; defaults to config.CHECKPOINT_REVISION",
+    )
     p.add_argument("--device", default=None, help="cuda (default if available) or cpu")
     args = p.parse_args()
 
@@ -57,7 +62,9 @@ def main():
     print(f"[step 3] loading checkpoint {args.checkpoint}")
     from rt.checkpoints import load_rt_model
 
-    model, cfg = load_rt_model(args.checkpoint, device=device)
+    model, cfg = load_rt_model(
+        args.checkpoint, device=device, revision=args.checkpoint_revision
+    )
     model = model.to(torch.bfloat16)  # the model runs in bf16 (matches the sampled data)
     want = {"binary_classification": "clf", "regression": "reg"}[config.TASK["task_type"]]
     if cfg.get("task_type", want) != want:

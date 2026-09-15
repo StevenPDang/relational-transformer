@@ -42,6 +42,10 @@ a Hub spec or a local path; `rt.checkpoints.load_rt_model` resolves either:
 pixi run python examples/inference/3_predict.py --checkpoint stanford-star/rt-j/classification
 ```
 
+`config.CHECKPOINT_REVISION` pins Hub checkpoints to an immutable commit for
+reproducible downloads. Override it with `--checkpoint-revision`; it is ignored
+when `--checkpoint` names a local path.
+
 Classification tasks need a classifier checkpoint (`rt-j/classification`) and
 regression tasks a regressor (`rt-j/regression`). Browse
 [huggingface.co/stanford-star](https://huggingface.co/stanford-star) for all

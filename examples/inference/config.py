@@ -71,3 +71,7 @@ TASK = {
 #
 # Browse https://huggingface.co/stanford-star for all released checkpoints.
 CHECKPOINT = "stanford-star/rt-j/regression"
+# Pin Hub checkpoints so a later update to the repository's main branch cannot
+# change or temporarily hide the files used by this pipeline. Ignored for local
+# checkpoint paths.
+CHECKPOINT_REVISION = "13d0559e468e58a31e5dc260c7be58c88698c826"
