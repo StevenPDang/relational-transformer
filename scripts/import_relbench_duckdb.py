@@ -3,16 +3,27 @@
 Run from the repository root::
 
     pixi run import-duckdb \
-      --dataset stanford-star/relbench/rel-amzaon --output rel-amazon.duckdb
+      --dataset stanford-star/relbench/rel-amazon
 
 ``--dataset`` can also be a local RelBench-format directory containing
-``manifest.yaml`` and ``db/*.parquet``.
+``manifest.yaml`` and ``db/*.parquet``. By default, databases are organized at
+``data/duckdb/<dataset>.duckdb``; ``--output`` still accepts an exact path.
 """
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
+
+
+DEFAULT_OUTPUT_DIR = Path("data/duckdb")
+
+
+def organized_output_path(dataset_name: str, output_dir: Path) -> Path:
+    """Return the conventional database path for a manifest dataset name."""
+    if not dataset_name or Path(dataset_name).name != dataset_name:
+        raise ValueError(f"Unsafe dataset name in manifest: {dataset_name!r}")
+    return output_dir / f"{dataset_name}.duckdb"
 
 
 def load_dataset(dataset_dir: Path, output: Path) -> list[tuple[str, int]]:
@@ -57,15 +68,27 @@ def main() -> None:
         description="Copy raw RelBench Parquet tables into a persistent DuckDB file."
     )
     parser.add_argument("--dataset", required=True, help="Local RelBench directory or Hub spec")
-    parser.add_argument("--output", required=True, type=Path, help="Persistent .duckdb file")
+    destination = parser.add_mutually_exclusive_group()
+    destination.add_argument(
+        "--output",
+        type=Path,
+        help="Exact persistent .duckdb path (backward-compatible override)",
+    )
+    destination.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIR,
+        help="Organized database directory (default: data/duckdb)",
+    )
     parser.add_argument("--revision", help="Optional Hugging Face revision for Hub datasets")
     args = parser.parse_args()
 
-    from scripts.preprocess import resolve_dataset_dir
+    from scripts.preprocess import dataset_name, resolve_dataset_dir
 
     dataset_dir = resolve_dataset_dir(args.dataset, revision=args.revision)
-    counts = load_dataset(dataset_dir, args.output)
-    print(f"Imported {len(counts)} tables into {args.output}:")
+    output = args.output or organized_output_path(dataset_name(dataset_dir), args.output_dir)
+    counts = load_dataset(dataset_dir, output)
+    print(f"Imported {len(counts)} tables into {output}:")
     for name, count in counts:
         print(f"  {name}: {count} rows")
 
