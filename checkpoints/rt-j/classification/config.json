@@ -1,0 +1,22 @@
+{
+  "codename": "rt-j-clf",
+  "name": "RT-J Classifier",
+  "task_type": "clf",
+  "checkpoint_file": "model.safetensors",
+  "embedding_model": "all-MiniLM-L12-v2",
+  "d_text": 384,
+  "model": {
+    "num_blocks": 12,
+    "d_model": 512,
+    "d_text": 384,
+    "num_heads": 8,
+    "d_ff": 2048,
+    "materialize_attn_masks": true
+  },
+  "provenance": {
+    "run_id": "pjbmgvu2",
+    "swa_step": 58000,
+    "project": "2026-04-17",
+    "recipe": "real_mixed_v6_5_486t"
+  }
+}

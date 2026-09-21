@@ -49,3 +49,6 @@ src/rt/_rustler*.so
 
 # temp files
 duckdb_temp_storage_DEFAULT-2.tmp
+checkpoints/rt-j/classification/model.safetensors
+.gitignore
+eval_full/rel-f1__driver-top3.csv
