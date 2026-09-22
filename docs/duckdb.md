@@ -44,3 +44,34 @@ the source of primary-key, foreign-key, and time-column metadata; the script doe
 not create SQL constraints. Importing into an existing file is allowed if the
 new table names do not conflict. A conflict stops the import and rolls back all
 tables from that attempt.
+
+## Check one task before comparing SQL contexts
+
+For `rel-f1/driver-top3`, run the row-alignment check against a local copy of
+the same RelBench dataset and preprocessed data used by evaluation:
+
+```bash
+pixi run python -m scripts.check_task_alignment \
+  --dataset /path/to/rel-f1 --pre-dir /path/to/pre \
+  --duckdb data/duckdb/rel-f1.duckdb --task driver-top3
+```
+
+The check compares every test row's entity and timestamp with the RelBench
+loader, verifies its `node_idx` range against `table_info.json`, and confirms
+that its entity ID resolves to the same zero-based raw entity row in DuckDB.
+It fails if the DuckDB import has a different entity row order. The evaluator
+uses `node_idx - node_idx_offset` to recover the test row position.
+
+Rust-sampler baseline command for the later score comparison:
+
+```bash
+pixi run eval --checkpoint stanford-star/rt-j/classification \
+  --pre-dir stanford-star/relbench-preprocessed \
+  --tasks rel-f1/driver-top3 --out-dir eval_out/driver-top3-rust \
+  --ctx-size 8192 --local-ctx-size 256 --bfs-width 32 \
+  --num-walks 10000 --walk-length 20 --prefer-latest --shuffle-seed 0
+```
+
+Record the AUROC printed by that run alongside the checkpoint revision, data
+revision, and `n` before comparing a SQL neighborhood. No baseline score is
+recorded here until the command has actually run.
