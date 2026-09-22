@@ -47,16 +47,17 @@ tables from that attempt.
 
 ## Check one task before comparing SQL contexts
 
-For `rel-f1/driver-top3`, run the row-alignment check against a local copy of
-the same RelBench dataset and preprocessed data used by evaluation:
+For `rel-f1/driver-top3`, run the row-alignment check against the same
+preprocessed data used by evaluation. It reads `meta.json` to find the RelBench
+source, then loads the task and raw entity table through the RelBench API:
 
 ```bash
 pixi run python -m scripts.check_task_alignment \
-  --dataset /path/to/rel-f1 --pre-dir /path/to/pre \
-  --duckdb data/duckdb/rel-f1.duckdb --task driver-top3
+  --pre-dir stanford-star/relbench-preprocessed \
+  --task driver-top3
 ```
 
-The check compares every test row's entity and timestamp with the RelBench
+The check reads every test row's entity and timestamp from the RelBench
 loader, verifies its `node_idx` range against `table_info.json`, and confirms
 that its entity ID resolves to the same zero-based raw entity row in DuckDB.
 It fails if the DuckDB import has a different entity row order. The evaluator
