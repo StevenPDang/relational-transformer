@@ -58,10 +58,16 @@ pixi run python -m scripts.check_task_alignment \
 ```
 
 The check reads every test row's entity and timestamp from the RelBench
-loader, verifies its `node_idx` range against `table_info.json`, and confirms
+loader, verifies its `node_idx` range against `table_info.json`, compares each
+timestamp with the stored preprocessed test node, and confirms
 that its entity ID resolves to the same zero-based raw entity row in DuckDB.
 It fails if the DuckDB import has a different entity row order. The evaluator
 uses `node_idx - node_idx_offset` to recover the test row position.
+
+Observed alignment result for `rel-f1/driver-top3`: 726 test rows and 726
+stored-node timestamps checked; task node indices 118997–119722; entity table
+`drivers` keyed by `driverId`; 726 unique entity/time pairs. The check passed
+against `stanford-star/relbench/rel-f1` and the imported DuckDB file.
 
 Rust-sampler baseline command for the later score comparison:
 

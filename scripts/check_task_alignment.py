@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 
 import duckdb
+import numpy as np
 import pandas as pd
 
 
@@ -45,6 +46,26 @@ def check_alignment(pre_dir: Path, database: Path, task: str, db_name: str) -> d
     node_idx = pd.Series(range(node_offset, node_offset + n))
     if not (node_idx.to_numpy() - node_offset == task_rows.index.to_numpy()).all():
         raise AssertionError("node indices do not map to RelBench test row positions")
+    from rt._rustler import node_timestamps
+
+    stored = node_timestamps(str(pre_dir / db_name), node_idx.tolist())
+    if any(value is None for value in stored):
+        raise AssertionError("preprocessed test nodes have missing timestamps")
+    # rustler normalizes datetimes to nanoseconds, then stores seconds as i32.
+    expected_ns = pd.to_datetime(task_rows[time_col], utc=True).astype("int64").to_numpy()
+    expected_seconds = np.where(
+        expected_ns >= 0,
+        expected_ns // 1_000_000_000,
+        -((-expected_ns) // 1_000_000_000),
+    )
+    expected_seconds = np.clip(expected_seconds, np.iinfo(np.int32).min, np.iinfo(np.int32).max)
+    mismatches = np.flatnonzero(np.asarray(stored, dtype=np.int64) != expected_seconds)
+    if mismatches.size:
+        row = int(mismatches[0])
+        raise AssertionError(
+            f"timestamp mismatch at test row {row}, node {int(node_idx[row])}: "
+            f"RelBench={int(expected_seconds[row])}, preprocessed={stored[row]}"
+        )
 
     con = duckdb.connect(str(database), read_only=True)
     try:
@@ -69,6 +90,7 @@ def check_alignment(pre_dir: Path, database: Path, task: str, db_name: str) -> d
     return {
         "task": f"{db_name}/{task}", "source": source, "test_rows": n,
         "task_node_idx_first": node_offset, "task_node_idx_last": node_offset + n - 1,
+        "timestamps_checked": n,
         "entity_table": entity_table, "entity_key": pkey,
         "entity_node_idx_first_example": int(entity_node_idx[0]) if n else None,
         "unique_test_entity_times": int(task_rows[[entity_col, time_col]].drop_duplicates().shape[0]),
@@ -85,7 +107,7 @@ def main() -> None:
     args = parser.parse_args()
     from rt.pre import resolve_pre_dir
 
-    pre_dir = Path(resolve_pre_dir(args.pre_dir, [args.db], "all-MiniLM-L12-v2", metadata_only=True))
+    pre_dir = Path(resolve_pre_dir(args.pre_dir, [args.db], "all-MiniLM-L12-v2"))
     print(json.dumps(check_alignment(pre_dir, args.duckdb, args.task, args.db), indent=2))
 
 
