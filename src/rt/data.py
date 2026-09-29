@@ -134,7 +134,12 @@ class RustlerDataset:
         ablate_schema_semantics,
         vector_db_path: str | None,
         train_only_fallback: bool,
+        sql_context_db: str | None = None,
     ):
+        if sql_context_db is not None and (
+            not tasks or any(t.db_name != "rel-f1" or t.table_name != "driver-top3" for t in tasks)
+        ):
+            raise ValueError("SQL context sampling currently supports only rel-f1/driver-top3")
         # `pre_dir` may be a local path or a HuggingFace repo spec; resolve to a
         # local root, downloading only the files needed for these databases.
         pre_dir = resolve_pre_dir(pre_dir, [t.db_name for t in tasks], embedding_model)
@@ -237,6 +242,12 @@ class RustlerDataset:
             train_only_fallback=train_only_fallback,
         )
         self.num_items = self.sampler.num_items
+
+        if sql_context_db is not None:
+            from rt.sql_context import load_rel_f1_contexts
+
+            contexts = load_rel_f1_contexts(pre_dir, sql_context_db, max(bfs_widths))
+            self.sampler.set_sql_contexts_py("rel-f1", contexts)
 
         self.d_text = d_text
         self.bool_as_num = bool_as_num

@@ -83,6 +83,7 @@ class Evaluator:
         world_size,
         ddp,
         device,
+        sql_context_db=None,
     ):
         self.tasks = [t for t in tasks if "synthetic" not in t.db_name]
         self.eval_splits = sorted(set(t.split for t in self.tasks if t.split))
@@ -138,6 +139,7 @@ class Evaluator:
                 ablate_schema_semantics=ablate_schema_semantics,
                 vector_db_path=vector_db_path,
                 train_only_fallback=train_only_fallback,
+                sql_context_db=sql_context_db,
             )
             eval_dataset = EvalDataset(
                 rustler_dataset=rustler_dataset,

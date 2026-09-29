@@ -72,13 +72,18 @@ against `stanford-star/relbench/rel-f1` and the imported DuckDB file.
 Rust-sampler baseline command for the later score comparison:
 
 ```bash
-pixi run eval --checkpoint stanford-star/rt-j/classification \
+pixi run --environment cuda124 eval \
+  --checkpoint checkpoints/rt-j/classification \
   --pre-dir stanford-star/relbench-preprocessed \
-  --tasks rel-f1/driver-top3 --out-dir eval_out/driver-top3-rust \
+  --tasks rel-f1/driver-top3 --out-dir eval_full \
   --ctx-size 8192 --local-ctx-size 256 --bfs-width 32 \
   --num-walks 10000 --walk-length 20 --prefer-latest --shuffle-seed 0
 ```
 
-Record the AUROC printed by that run alongside the checkpoint revision, data
-revision, and `n` before comparing a SQL neighborhood. No baseline score is
-recorded here until the command has actually run.
+This uses the local checkpoint directory and explicitly selects the CUDA
+environment. The shown context flags match `eval.py`'s defaults, so the
+shorter command without them uses the same settings. Record the AUROC printed
+by that run alongside the local checkpoint provenance, data revision, and `n` before
+comparing a SQL neighborhood. No baseline score is recorded here until the
+command has actually run.
+

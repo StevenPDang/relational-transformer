@@ -5,8 +5,7 @@ in-context context for each test row, run the model's forward pass, and (for
 RelBench) score the predictions with RelBench's own evaluator. There is no
 fine-tuning — RT predicts zero-shot from the context it is given.
 
-A checkpoint is a local path or a Hub model repo such as
-`stanford-star/rt-j/classification`; its `config.json` records whether it is a
+A checkpoint is a local path or a Hub model repo; its `config.json` records whether it is a
 classifier (`clf`) or regressor (`reg`), so eval automatically restricts to the
 matching tasks.
 
@@ -14,12 +13,13 @@ matching tasks.
 
 Inference takes a `--pre-dir` of preprocessed data — either a local path you
 produced (see [preprocess.md](preprocess.md)) or a Hub repo such as
-`stanford-star/relbench-preprocessed`, downloaded and cached on demand. So you can
-reproduce the RelBench numbers with nothing downloaded up front:
+`stanford-star/relbench-preprocessed`, downloaded and cached on demand. With
+the classifier weights in `checkpoints/rt-j/classification`, run:
 
 ```bash
-# checkpoint and data both come from the Hub
-pixi run eval --checkpoint stanford-star/rt-j/classification \
+# checkpoint is local; preprocessed data comes from the Hub
+pixi run --environment cuda124 eval \
+  --checkpoint checkpoints/rt-j/classification \
   --pre-dir stanford-star/relbench-preprocessed --out-dir eval_out
 ```
 
@@ -47,12 +47,12 @@ whole `db` (all of its tasks of the checkpoint's kind):
 
 ```bash
 # just one task
-pixi run eval --checkpoint stanford-star/rt-j/classification \
+pixi run --environment cuda124 eval --checkpoint checkpoints/rt-j/classification \
   --pre-dir stanford-star/relbench-preprocessed \
   --tasks rel-f1/driver-top3 --out-dir eval_out
 
 # every clf task in one database
-pixi run eval --checkpoint stanford-star/rt-j/classification \
+pixi run --environment cuda124 eval --checkpoint checkpoints/rt-j/classification \
   --pre-dir stanford-star/relbench-preprocessed \
   --tasks rel-f1 --out-dir eval_out
 ```

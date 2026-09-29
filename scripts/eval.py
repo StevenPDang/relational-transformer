@@ -1,8 +1,7 @@
 #!/usr/bin/env python
 """Evaluate an RT checkpoint on the RelBench benchmark tasks.
 
-Loads a checkpoint -- a local dir/file or a Hub model repo such as
-``stanford-star/rt-j/classification`` -- evaluates every task of its kind (clf/reg) in
+Loads a checkpoint -- a local dir/file or a Hub model repo -- and evaluates every task of its kind (clf/reg) in
 the preprocessed RelBench data (``--pre-dir``, local or Hub), and reports metrics
 through RelBench's own leaderboard evaluator: regression predictions are
 denormalized to the original target scale, classification logits are sigmoided
@@ -14,7 +13,7 @@ and can be re-validated with ``python -m relbench.leaderboard <out-dir>``.
 
 Single-process (one GPU). Example:
 
-    pixi run eval --checkpoint stanford-star/rt-j/classification \\
+    pixi run --environment cuda124 eval --checkpoint checkpoints/rt-j/classification \\
         --pre-dir stanford-star/relbench-preprocessed --out-dir eval_out
 """
 
@@ -50,6 +49,9 @@ def main() -> None:
     ap.add_argument("--ctx-size", type=int, default=8192)
     ap.add_argument("--local-ctx-size", type=int, default=256)
     ap.add_argument("--bfs-width", type=int, default=32)
+    ap.add_argument("--sql-context-db", default=None,
+                    help="opt-in rel-f1/driver-top3 SQL neighborhoods from this DuckDB file; "
+                         "--bfs-width bounds recent results and historical training rows per seed")
     ap.add_argument("--num-walks", type=int, default=10_000)
     ap.add_argument("--walk-length", type=int, default=20)
     ap.add_argument("--prefer-latest", action=argparse.BooleanOptionalAction, default=True,
@@ -88,6 +90,7 @@ def main() -> None:
         tokens_per_gpu=args.tokens_per_gpu, items_per_task=args.items_per_task,
         num_workers=args.num_workers,
         prefer_latest=args.prefer_latest, shuffle_seed=args.shuffle_seed,
+        sql_context_db=args.sql_context_db,
     )
 
     if args.mode == "ensemble":

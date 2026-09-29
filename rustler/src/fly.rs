@@ -338,6 +338,8 @@ struct Dataset {
     p2f_adj_mmap: Mmap,
     offsets: Vec<i64>,
     table_info: HashMap<String, TableInfo>,
+    // Opt-in neighborhoods materialized by task-specific, non-recursive SQL.
+    sql_contexts: Option<HashMap<i32, Vec<(i32, usize)>>>,
     // When `Some`, a deterministic bijection over this database's column
     // indices used to ablate schema semantics: at col_name_values lookup
     // time, the original col_name_idx is replaced by col_name_perm[orig]
@@ -501,6 +503,38 @@ impl Sampler {
     #[getter]
     fn num_items(&self) -> usize {
         self.items.len()
+    }
+
+    fn set_sql_contexts_py(
+        &mut self,
+        db_name: &str,
+        contexts: HashMap<i32, Vec<(i32, usize)>>,
+    ) -> PyResult<()> {
+        use pyo3::exceptions::PyValueError;
+        let dataset = self
+            .datasets
+            .get_mut(db_name)
+            .ok_or_else(|| PyValueError::new_err("Unknown SQL context database"))?;
+        let valid = |idx: i32| idx >= 0 && (idx as usize) < dataset.offsets.len() - 1;
+        if contexts
+            .iter()
+            .any(|(&seed, nodes)| !valid(seed) || nodes.iter().any(|&(idx, _)| !valid(idx)))
+        {
+            return Err(PyValueError::new_err("SQL context node index out of range"));
+        }
+        // Every possible same-table seed needs an entry; never silently fall
+        // back to BFS when a materialized SQL neighborhood is missing.
+        for ((db, _, _, _), &(start, end)) in
+            self.dataset_tuples.iter().zip(self.table_ranges.iter())
+        {
+            if db == db_name && (start..end).any(|idx| !contexts.contains_key(&idx)) {
+                return Err(PyValueError::new_err(
+                    "SQL contexts missing same-table seeds",
+                ));
+            }
+        }
+        dataset.sql_contexts = Some(contexts);
+        Ok(())
     }
 
     fn batch_py(
@@ -914,6 +948,7 @@ impl Sampler {
                 p2f_adj_mmap,
                 offsets,
                 table_info,
+                sql_contexts: None,
                 col_name_perm,
                 #[cfg(feature = "vecdb")]
                 vector_db,
@@ -1846,6 +1881,34 @@ impl Sampler {
         visited_at_depth: &mut HashMap<i32, usize>,
         deadline: Instant,
     ) -> Vec<(i32, usize)> {
+        if let Some(contexts) = &dataset.sql_contexts {
+            let nodes = contexts.get(&start_idx).expect("SQL context missing seed");
+            let seed = get_node(dataset, start_idx);
+            let mut result = Vec::new();
+            let mut num_cells = 0;
+            for &(idx, depth) in nodes {
+                check_deadline(deadline);
+                if visited_at_depth
+                    .get(&idx)
+                    .is_some_and(|&prev| prev <= depth)
+                {
+                    continue;
+                }
+                let node = get_node(dataset, idx);
+                if node.timestamp.is_some()
+                    && (seed.timestamp.is_none() || node.timestamp > seed.timestamp)
+                {
+                    continue;
+                }
+                num_cells += node.col_name_idxs.len();
+                if num_cells >= local_ctx_size {
+                    break;
+                }
+                visited_at_depth.insert(idx, depth);
+                result.push((idx, depth));
+            }
+            return result;
+        }
         let mut result: Vec<(i32, usize)> = Vec::with_capacity(128);
 
         let start_node = get_node(dataset, start_idx);
