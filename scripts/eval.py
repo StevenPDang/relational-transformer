@@ -51,7 +51,7 @@ def main() -> None:
     ap.add_argument("--bfs-width", type=int, default=32)
     ap.add_argument("--sql-context-db", default=None,
                     help="opt-in rel-f1/driver-top3 SQL neighborhoods from this DuckDB file; "
-                         "--bfs-width bounds recent results and historical training rows per seed")
+                         "--bfs-width bounds each DB history and historical label rows per seed")
     ap.add_argument("--num-walks", type=int, default=10_000)
     ap.add_argument("--walk-length", type=int, default=20)
     ap.add_argument("--prefer-latest", action=argparse.BooleanOptionalAction, default=True,

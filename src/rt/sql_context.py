@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import json
+from itertools import zip_longest
 from pathlib import Path
 
 
 # Keep rowid explicit across joins: Rust's node index is table offset + raw row.
-RECENT_RESULTS_SQL = """
+RECENT_DRIVER_ROWS_SQL = """
 SELECT r.rowid, race.rowid, constructor.rowid, circuit.rowid
 FROM (
-    SELECT rowid, raceId, constructorId, date
-    FROM results
+    SELECT rowid, raceId, {constructor_col} AS constructorId, date
+    FROM {table}
     WHERE driverId = ? AND date <= ?
     ORDER BY date DESC, rowid
     LIMIT ?
@@ -20,6 +21,20 @@ LEFT JOIN races race ON race.raceId = r.raceId AND race.date <= ?
 LEFT JOIN constructors constructor ON constructor.constructorId = r.constructorId
 LEFT JOIN circuits circuit ON circuit.circuitId = race.circuitId
 ORDER BY r.date DESC, r.rowid
+"""
+
+# Only these fixed table/column names are interpolated; values stay parameters.
+HISTORY_TABLES = (
+    ("qualifying", "constructorId"),
+    ("standings", "NULL::BIGINT"),
+    ("results", "constructorId"),
+)
+
+HISTORICAL_LABELS_SQL = """
+SELECT node_idx FROM sql_task_labels
+WHERE driverId = ? AND date < ?
+ORDER BY date DESC, node_idx
+LIMIT ?
 """
 
 
@@ -40,20 +55,33 @@ def query_context_nodes(con, table_info, driver_id, timestamp, width):
 
     for row, in con.execute('SELECT rowid FROM drivers WHERE driverId = ?', [driver_id]).fetchall():
         add("drivers", row, 1)
-    for result, race, constructor, circuit in con.execute(
-        RECENT_RESULTS_SQL, [driver_id, timestamp, width, timestamp]
-    ).fetchall():
-        add("results", result, 2)
-        add("races", race, 3)
-        add("constructors", constructor, 3)
-        add("circuits", circuit, 4)
+    # Labels are small, high-value rows. Emit them before DB histories so that
+    # the local cell budget cannot discard the entire label-neighbor query.
     for node, in con.execute(
-        "SELECT node_idx FROM sql_train_labels WHERE driverId = ? AND date < ? "
-        "ORDER BY date DESC, node_idx LIMIT ?", [driver_id, timestamp, width]
+        HISTORICAL_LABELS_SQL, [driver_id, timestamp, width]
     ).fetchall():
         if int(node) not in seen:
             seen.add(int(node))
             nodes.append((int(node), 2))
+
+    histories = [
+        con.execute(
+            RECENT_DRIVER_ROWS_SQL.format(table=table, constructor_col=constructor_col),
+            [driver_id, timestamp, width, timestamp],
+        ).fetchall()
+        for table, constructor_col in HISTORY_TABLES
+    ]
+    # Round-robin by recency rank: qualifying, standings, results, then their
+    # next-most-recent rows. Parents remain beside the row that references them.
+    for group in zip_longest(*histories):
+        for (table, _), row in zip(HISTORY_TABLES, group):
+            if row is None:
+                continue
+            idx, race, constructor, circuit = row
+            add(table, idx, 2)
+            add("races", race, 3)
+            add("constructors", constructor, 3)
+            add("circuits", circuit, 4)
     return nodes
 
 
@@ -61,7 +89,8 @@ def load_rel_f1_contexts(pre_dir, database, width):
     """Validate source alignment, then materialize all possible task seeds.
 
     All splits need neighborhoods because Rust may pick historical same-table
-    seeds beyond the evaluation split. Only training rows are SQL label context.
+    seeds beyond the evaluation split. Earlier rows from all task splits supply
+    label neighbors, matching the existing sampler's split policy.
     """
     import duckdb
     import numpy as np
@@ -82,7 +111,9 @@ def load_rel_f1_contexts(pre_dir, database, width):
     try:
         # Verify values and order, not just counts: rowid + offset must identify
         # the same raw row used by preprocessing. No assumptions about PK values.
-        for table in ("drivers", "results", "races", "constructors", "circuits"):
+        for table in (
+            "drivers", "results", "qualifying", "standings", "races", "constructors", "circuits"
+        ):
             raw = raw_db.table_dict[table].df.reset_index(drop=True)
             sql = con.execute(f'SELECT * FROM "{table}" ORDER BY rowid').df()
             if len(raw) != info[f"{table}:Db"]["num_nodes"]:
@@ -107,7 +138,7 @@ def load_rel_f1_contexts(pre_dir, database, width):
             if stored != seconds.tolist():
                 raise ValueError(f"Preprocessed task timestamps differ for {split}")
             splits.append(rows)
-        con.register("sql_train_labels", splits[0])
+        con.register("sql_task_labels", pd.concat(splits, ignore_index=True))
         contexts = {}
         for rows in splits:
             for driver_id, timestamp, node_idx in rows.itertuples(index=False, name=None):

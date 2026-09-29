@@ -5,9 +5,11 @@ Random walks and same-table seed selection remain in Rust. SQL supplies each
 seed's neighborhood; Rust still supplies embeddings, masks, deduplication,
 cell budgets, and the model input format.
 
-Non-recursive queries select the driver's row, recent results at or before the
-seed timestamp, their races, constructors and circuits, and earlier training
-labels for that driver. This is a small task-specific neighborhood, not an
+Non-recursive queries select the driver's row, earlier labels for that driver,
+and recent qualifying, standings and results rows at or before the seed
+timestamp, with their races, constructors and circuits. Labels precede DB
+history, which is interleaved by recency rank to retain all three history tables
+within small budgets. This is a small task-specific neighborhood, not an
 exact reproduction of the BFS sample. Raw values are retained rather than
 aggregated into features.
 
@@ -32,19 +34,25 @@ for each sampled test row, and checks target placement and temporal cutoffs.
 Use `--num-walks 10000` to retain the normal walk-based seed ranking; the smoke
 command defaults to `0` for quick iteration.
 
-Run a small model evaluation on a CUDA machine with:
+Run the full test split on a CUDA machine with the original baseline's context
+settings, changing only the sampler:
 
 ```bash
 pixi run --environment cuda124 eval \
   --checkpoint checkpoints/rt-j/classification \
   --pre-dir stanford-star/relbench-preprocessed \
-  --tasks rel-f1/driver-top3 --out-dir eval_sql_small \
+  --tasks rel-f1/driver-top3 --out-dir eval_sql_matched \
   --sql-context-db data/duckdb/rel-f1.duckdb \
-  --ctx-size 256 --local-ctx-size 128 --bfs-width 8 \
-  --items-per-task 16 --tokens-per-gpu 1024 --num-workers 0
+  --ctx-size 8192 --local-ctx-size 256 --bfs-width 32 \
+  --num-walks 10000 --walk-length 20 --prefer-latest --shuffle-seed 0
 ```
 
-`--bfs-width` bounds recent results and historical labels per seed in SQL mode.
+Repeat the command without `--sql-context-db` and with
+`--out-dir eval_bfs_matched` for the matching BFS run. Both runs must report
+`n=726`, use the same checkpoint and data, and keep the same context flags.
+
+`--bfs-width` bounds rows from each history table and historical labels per seed
+in SQL mode.
 `--local-ctx-size` and `--ctx-size` retain their existing cell budget semantics.
 Leave `--num-walks` at its default to preserve walk-based seed selection; set it
 to `0` for a faster smoke run with random same-table seeds. Omit
@@ -54,9 +62,11 @@ raw RelBench source corresponding to the preprocessed data, plus DuckDB (both
 available in the Pixi environment).
 
 Neighborhoods are materialized for all train/val/test seeds before workers
-start. The SQL label-neighbor query uses only the training split and strictly
-earlier timestamps. Existing same-table seed selection still uses its original
-split policy. Rust also filters temporal nodes against the seed timestamp
+start. The SQL label-neighbor query uses earlier rows from all three splits,
+matching the existing BFS sampler's split policy. The query requires strictly
+earlier timestamps, so it excludes the seed's own label. Existing same-table
+seed selection retains its original split and timestamp policies.
+Rust also filters temporal nodes against the seed timestamp
 and retains its existing target/leakage masking. Relationship depths shown in
 batch visualization metadata describe the fixed joins, not a BFS traversal.
 
@@ -66,8 +76,17 @@ The loader checks raw table values/order and task counts/timestamps against the
 source and preprocessed metadata. Use matching data revisions: preprocessing
 does not store the task entity keys needed to prove full task-row identity.
 
-Verified locally: four focused tests pass, including SQL cutoff/order/mapping
-and native sampler bypass/bounds/temporal behavior. The cached real rel-f1 data
-produced 2,667 seed neighborhoods and full 256-cell batches. No AUROC comparison
-has been run; the existing FlexAttention CPU compilation path is unsupported on
-this Mac, so model evaluation requires the CUDA environment.
+Verified locally: SQL cutoff/order/mapping tests and native sampler
+bypass/bounds/temporal tests pass. The cached real rel-f1 data produced 2,667
+seed neighborhoods. On four identical test targets with 10,000 walks, the
+label counts were:
+
+| Context / local cells / width | Original BFS | Initial SQL | Revised SQL |
+| --- | --- | --- | --- |
+| 256 / 128 / 8 | 6–32 | 2–3 | 8–20 |
+| 8192 / 256 / 32 | 789–931 | 95–232 | 457–546 |
+
+The revised contexts include qualifying, standings and results. These are
+sampling checks, not model scores. No new AUROC comparison has been run; the
+existing FlexAttention CPU compilation path is unsupported on this Mac, so
+model evaluation requires the CUDA environment.
