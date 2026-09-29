@@ -20,6 +20,7 @@ Single-process (one GPU). Example:
 from __future__ import annotations
 
 import argparse
+import time
 
 import torch
 
@@ -67,12 +68,23 @@ def main() -> None:
     ap.add_argument("--no-csv", action="store_true")
     args = ap.parse_args()
 
+    started_at = time.perf_counter()
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    def report_runtime(label: str, since: float) -> float:
+        # CUDA work is asynchronous; finish it before measuring elapsed time.
+        if device == "cuda":
+            torch.cuda.synchronize()
+        now = time.perf_counter()
+        print(f"runtime | {label}: {now - since:.2f}s", flush=True)
+        return now
+
     net, config = load_rt_model(args.checkpoint, device=device, compile=False)
     net = net.to(torch.bfloat16)
     task_type = config.get("task_type")
     print(f"loaded {config.get('name', args.checkpoint)} "
           f"(task_type={task_type}, embed={config['embedding_model']}) on {device}")
+    setup_started_at = report_runtime("model loading", started_at)
 
     def of_kind(tasks):
         return [t for t in tasks if t.task_type == task_type] if task_type in ("clf", "reg") else tasks
@@ -101,10 +113,14 @@ def main() -> None:
         test_tasks = selected(of_kind(get_tasks("relbench_eval_test", args.pre_dir)))
         if not test_tasks:
             raise SystemExit(f"no {task_type} tasks found in {args.pre_dir}")
+        evaluation_started_at = report_runtime("task setup", setup_started_at)
         run_ensemble(net, args.pre_dir, val_tasks, test_tasks, grid=grid,
                      ensemble_size=args.ensemble_size, ctx_size=args.ctx_size,
                      reg_metric=args.reg_metric, out_dir=args.out_dir, no_csv=args.no_csv,
                      **eval_kwargs)
+        # Ensemble evaluator construction happens inside run_ensemble.
+        report_runtime("ensemble setup, tuning, evaluation and scoring", evaluation_started_at)
+        report_runtime("total", started_at)
         return
 
     from rt.eval_utils import build_evaluator, run_and_report
@@ -115,9 +131,12 @@ def main() -> None:
     ev = build_evaluator(tasks, args.pre_dir, ctx_size=args.ctx_size,
                          local_ctx_size=args.local_ctx_size, bfs_width=args.bfs_width,
                          **eval_kwargs)
+    evaluation_started_at = report_runtime("task and evaluator setup", setup_started_at)
     run_and_report(net, tasks, args.pre_dir, ctx_size=args.ctx_size,
                    reg_metric=args.reg_metric, out_dir=args.out_dir, no_csv=args.no_csv,
                    evaluator=ev, embedding_model=config["embedding_model"])
+    report_runtime("evaluation and scoring", evaluation_started_at)
+    report_runtime("total", started_at)
 
 
 if __name__ == "__main__":
