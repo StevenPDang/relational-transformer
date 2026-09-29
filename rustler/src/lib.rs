@@ -48,7 +48,7 @@ fn node_timestamps(pre_dataset_dir: &str, node_idxs: Vec<usize>) -> PyResult<Vec
 /// rkyv format). Only built into wheels with the `pre` feature. Releases the GIL.
 #[cfg(feature = "pre")]
 #[pyfunction]
-#[pyo3(signature = (dataset_dir, out_dir, *, source=None, skip_tasks=false, skip_db=false))]
+#[pyo3(signature = (dataset_dir, out_dir, *, source=None, skip_tasks=false, skip_db=false, skip_graph=false))]
 fn preprocess(
     py: Python<'_>,
     dataset_dir: String,
@@ -56,6 +56,7 @@ fn preprocess(
     source: Option<String>,
     skip_tasks: bool,
     skip_db: bool,
+    skip_graph: bool,
 ) -> PyResult<()> {
     py.allow_threads(move || {
         pre::main(pre::Cli {
@@ -64,6 +65,7 @@ fn preprocess(
             source,
             skip_tasks,
             skip_db,
+            skip_graph,
         })
     });
     Ok(())

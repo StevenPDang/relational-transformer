@@ -11,6 +11,10 @@ directory* -- one ``<dataset>__<task>.csv`` prediction table per task -- that is
 scored with ``relbench.leaderboard.evaluate_task`` (AUROC for clf, NMAE for reg)
 and can be re-validated with ``python -m relbench.leaderboard <out-dir>``.
 
+For rel-f1/driver-top3, ``--raw-dataset`` plus a fresh ``--prepare-dir`` includes
+cell preparation, text embeddings, and graph construction (``--sampler bfs``)
+or raw SQL import (``--sampler sql``) in the reported runtime.
+
 Single-process (one GPU). Example:
 
     pixi run --environment cuda124 eval --checkpoint checkpoints/rt-j/classification \\
@@ -20,7 +24,9 @@ Single-process (one GPU). Example:
 from __future__ import annotations
 
 import argparse
+import json
 import time
+from pathlib import Path
 
 import torch
 
@@ -32,7 +38,14 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--checkpoint", required=True, help="local path or Hub model repo")
-    ap.add_argument("--pre-dir", required=True, help="preprocessed RelBench (local or Hub)")
+    inputs = ap.add_mutually_exclusive_group(required=True)
+    inputs.add_argument("--pre-dir", help="preprocessed RelBench (local or Hub)")
+    inputs.add_argument("--raw-dataset", help="raw rel-f1 directory or Hub spec; includes preparation in runtime")
+    ap.add_argument("--prepare-dir", help="fresh output directory for raw-data preparation (must not exist)")
+    ap.add_argument("--sampler", choices=["bfs", "sql"], default="bfs",
+                    help="raw-data sampler: bfs builds a graph; sql omits traversal edges and random walks")
+    ap.add_argument("--embedding-batch-size", type=int, default=1024,
+                    help="text-embedding batch size for raw-data preparation")
     ap.add_argument("--mode", default="simple", choices=["simple", "ensemble"],
                     help="simple: one context config on the test split; "
                          "ensemble: tune context config per task on val, then average "
@@ -67,17 +80,44 @@ def main() -> None:
     ap.add_argument("--reg-metric", default="mae", choices=["mae", "r2"])
     ap.add_argument("--no-csv", action="store_true")
     args = ap.parse_args()
+    if args.raw_dataset:
+        if not args.prepare_dir:
+            ap.error("--raw-dataset requires --prepare-dir (use a fresh directory for each benchmark run)")
+        if args.sql_context_db:
+            ap.error("raw SQL builds its own DuckDB database; omit --sql-context-db")
+        if args.mode != "simple" or args.recipe != "relbench_eval_test":
+            ap.error("raw evaluation currently supports simple mode on the test split")
+        if args.tasks is not None and args.tasks != ["rel-f1/driver-top3"]:
+            ap.error("raw evaluation currently supports only --tasks rel-f1/driver-top3")
+        if args.sampler == "sql" and not args.prefer_latest:
+            ap.error("raw SQL currently uses recency-ordered seeds; omit --no-prefer-latest")
+        args.tasks = ["rel-f1/driver-top3"]
+    elif args.prepare_dir or args.sampler != "bfs":
+        ap.error("--prepare-dir and --sampler sql require --raw-dataset; use --sql-context-db with prepared data")
 
     started_at = time.perf_counter()
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    timings = {}
+    preparation_timings = {}
 
     def report_runtime(label: str, since: float) -> float:
         # CUDA work is asynchronous; finish it before measuring elapsed time.
         if device == "cuda":
             torch.cuda.synchronize()
         now = time.perf_counter()
-        print(f"runtime | {label}: {now - since:.2f}s", flush=True)
+        timings[label] = now - since
+        print(f"runtime | {label}: {timings[label]:.2f}s", flush=True)
         return now
+
+    def finish():
+        report_runtime("total", started_at)
+        out = Path(args.out_dir).expanduser()
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "runtime.json").write_text(json.dumps({
+            "sampler": args.sampler if args.raw_dataset else ("sql-hybrid" if args.sql_context_db else "bfs"),
+            "device": device, "seconds": timings,
+            "preparation_seconds": preparation_timings, "settings": vars(args),
+        }, indent=2) + "\n")
 
     net, config = load_rt_model(args.checkpoint, device=device, compile=False)
     net = net.to(torch.bfloat16)
@@ -85,6 +125,22 @@ def main() -> None:
     print(f"loaded {config.get('name', args.checkpoint)} "
           f"(task_type={task_type}, embed={config['embedding_model']}) on {device}")
     setup_started_at = report_runtime("model loading", started_at)
+
+    if args.raw_dataset:
+        from rt.raw_eval import prepare_raw_eval
+
+        if task_type != "clf":
+            ap.error("rel-f1/driver-top3 requires a classification checkpoint")
+        args.pre_dir, args.sql_context_db, preparation_timings = prepare_raw_eval(
+            args.raw_dataset, args.prepare_dir, sampler=args.sampler,
+            embedding_model=config["embedding_model"], d_text=config["d_text"], device=device,
+            batch_size=args.embedding_batch_size,
+        )
+        for label, seconds in preparation_timings.items():
+            print(f"runtime | preparation / {label}: {seconds:.2f}s", flush=True)
+        setup_started_at = report_runtime("raw data preparation", setup_started_at)
+        if args.sampler == "sql":
+            print("raw SQL uses SQL historical seeds; --num-walks and --walk-length do not apply", flush=True)
 
     def of_kind(tasks):
         return [t for t in tasks if t.task_type == task_type] if task_type in ("clf", "reg") else tasks
@@ -120,7 +176,7 @@ def main() -> None:
                      **eval_kwargs)
         # Ensemble evaluator construction happens inside run_ensemble.
         report_runtime("ensemble setup, tuning, evaluation and scoring", evaluation_started_at)
-        report_runtime("total", started_at)
+        finish()
         return
 
     from rt.eval_utils import build_evaluator, run_and_report
@@ -136,7 +192,7 @@ def main() -> None:
                    reg_metric=args.reg_metric, out_dir=args.out_dir, no_csv=args.no_csv,
                    evaluator=ev, embedding_model=config["embedding_model"])
     report_runtime("evaluation and scoring", evaluation_started_at)
-    report_runtime("total", started_at)
+    finish()
 
 
 if __name__ == "__main__":

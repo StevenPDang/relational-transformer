@@ -1,5 +1,69 @@
 # Small rel-f1 SQL sampling experiment
 
+## Compare SQL and BFS starting from raw data
+
+Use `--raw-dataset` instead of `--pre-dir` to include preparation in evaluation
+runtime. Raw evaluation currently supports `rel-f1/driver-top3` on the complete
+test split in simple mode. No hosted preprocessed graph is read by this path.
+
+SQL encodes raw cells and their foreign-key references for the transformer's
+attention masks, but creates no forward traversal edges or reverse adjacency
+file. DuckDB imports the raw Parquet tables, selects local neighborhoods, and
+orders historical task seeds by same driver first, then recency. It replaces
+both BFS and random walks. `--num-walks` and `--walk-length` do not apply to raw
+SQL. The SQL historical seeds have strictly earlier timestamps; the Rust BFS
+baseline retains its original seed policy. This changes sampling behavior, so
+the previous hybrid SQL AUROC does not establish raw SQL's accuracy.
+
+Both paths run the same cell normalization and compute text embeddings from
+scratch using the checkpoint's embedding model. They still produce a cell
+store: avoiding traversal-graph generation does not eliminate model-input
+encoding or the row-level foreign-key metadata the model requires.
+
+Run on the same CUDA machine, using a fresh `--prepare-dir` each time:
+
+```bash
+pixi run --environment cuda124 eval \
+  --checkpoint checkpoints/rt-j/classification \
+  --raw-dataset stanford-star/relbench/rel-f1 \
+  --prepare-dir data/raw_eval/sql_run1 --sampler sql \
+  --tasks rel-f1/driver-top3 --out-dir eval_sql_raw_run1 \
+  --ctx-size 8192 --local-ctx-size 256 --bfs-width 32 \
+  --prefer-latest --shuffle-seed 0
+
+pixi run --environment cuda124 eval \
+  --checkpoint checkpoints/rt-j/classification \
+  --raw-dataset stanford-star/relbench/rel-f1 \
+  --prepare-dir data/raw_eval/bfs_run1 --sampler bfs \
+  --tasks rel-f1/driver-top3 --out-dir eval_bfs_raw_run1 \
+  --ctx-size 8192 --local-ctx-size 256 --bfs-width 32 \
+  --num-walks 10000 --walk-length 20 --prefer-latest --shuffle-seed 0
+```
+
+`--prepare-dir` must not exist: each run builds new artifacts rather than
+silently reusing a graph, embeddings, or DuckDB import. Repeat with `run2` and
+`run3`, alternating sampler order. For a reproducible comparison, resolve the
+raw dataset once and pass the same local directory to both commands. Keep the
+checkpoint, embedding batch size, worker count and hardware identical. Confirm
+that both runs report `n=726` and compare their AUROC as well as runtime.
+
+Each output directory gets `runtime.json`. Its `seconds` object records model
+loading, raw preparation, evaluator setup, evaluation/scoring, and total time.
+`preparation_seconds` breaks down raw input resolution, cell encoding (plus
+graph construction for BFS), text embeddings, and DuckDB import for SQL. This
+breakdown is included in `raw data preparation`, so do not add it twice.
+`total` starts after CLI argument parsing and includes raw-data preparation;
+Python imports and Pixi's native build/install step are outside that clock.
+CUDA is synchronized at evaluation timing boundaries.
+
+Verified locally: graph-free and graph-backed encoders produce identical model
+tensors for identical SQL selections, including forward-key attention metadata.
+Both raw-data paths also produced complete 726-row submissions from the cached
+rel-f1 source with real preparation/embeddings/sampling and mock predictions.
+That smoke check does not measure model accuracy or GPU inference performance.
+
+## Existing hybrid SQL path using prepared data
+
 The first experiment replaces local BFS expansion for `rel-f1/driver-top3`.
 Random walks and same-table seed selection remain in Rust. SQL supplies each
 seed's neighborhood; Rust still supplies embeddings, masks, deduplication,

@@ -200,6 +200,9 @@ pub struct Cli {
     /// Keep database tables out of the node vector (task nodes only).
     #[arg(long, default_value_t = false)]
     pub skip_db: bool,
+    /// Encode cells and forward-key attention metadata without a traversal graph.
+    #[arg(long, default_value_t = false)]
+    pub skip_graph: bool,
     /// Provenance recorded in `meta.json` (e.g. the source HF dataset spec).
     #[arg(long)]
     pub source: Option<String>,
@@ -462,7 +465,11 @@ pub fn main(cli: Cli) {
         .map(|_| Node::default())
         .collect::<Vec<_>>();
     let mut p2f_adj = Adj {
-        adj: vec![Vec::new(); num_rows_sum as usize],
+        adj: if cli.skip_graph {
+            Vec::new()
+        } else {
+            vec![Vec::new(); num_rows_sum as usize]
+        },
     };
 
     for ((_table_name, table_type), table) in &table_map {
@@ -564,6 +571,12 @@ pub fn main(cli: Cli) {
                         let pnode_idx = i32::try_from(ptable_offset + pval)
                             .expect("parent node index overflow");
                         node.f2p_nbr_idxs.push(pnode_idx);
+
+                        // Forward keys are model attention metadata, not a
+                        // sampling index. SQL never needs traversal edges.
+                        if cli.skip_graph {
+                            continue;
+                        }
 
                         let ptimestamp = ptable
                             .tcol_name
@@ -769,18 +782,20 @@ pub fn main(cli: Cli) {
     let bytes = rkyv::to_bytes::<Error>(&Offsets { offsets }).unwrap();
     writer.write_all(&bytes).unwrap();
 
-    println!("sorting p2f edges by timestamp...");
-    let tic_sort = Instant::now();
-    for edges in &mut p2f_adj.adj {
-        edges.sort_by_key(|edge| edge.timestamp);
-    }
-    println!("sorted p2f edges in {:?}", tic_sort.elapsed());
+    if !cli.skip_graph {
+        println!("sorting p2f edges by timestamp...");
+        let tic_sort = Instant::now();
+        for edges in &mut p2f_adj.adj {
+            edges.sort_by_key(|edge| edge.timestamp);
+        }
+        println!("sorted p2f edges in {:?}", tic_sort.elapsed());
 
-    println!("writing out p2f_adj...");
-    let file = fs::File::create(format!("{}/p2f_adj.rkyv", pre_path)).unwrap();
-    let mut writer = BufWriter::new(file);
-    let bytes = rkyv::to_bytes::<Error>(&p2f_adj).unwrap();
-    writer.write_all(&bytes).unwrap();
+        println!("writing out p2f_adj...");
+        let file = fs::File::create(format!("{}/p2f_adj.rkyv", pre_path)).unwrap();
+        let mut writer = BufWriter::new(file);
+        let bytes = rkyv::to_bytes::<Error>(&p2f_adj).unwrap();
+        writer.write_all(&bytes).unwrap();
+    }
     println!("done in {:?}.", tic.elapsed());
 
     // Self-describing metadata for the preprocessed artifact. The embedding
@@ -789,6 +804,7 @@ pub fn main(cli: Cli) {
     let meta = serde_json::json!({
         "name": name,
         "format_version": PRE_FORMAT_VERSION,
+        "sampling_graph": !cli.skip_graph,
         "source": source,
         "num_db_tables": num_db_tables,
         "num_task_tables": num_task_tables,
@@ -798,7 +814,7 @@ pub fn main(cli: Cli) {
         "files": {
             "nodes": "nodes.rkyv",
             "offsets": "offsets.rkyv",
-            "p2f_adj": "p2f_adj.rkyv",
+            "p2f_adj": if cli.skip_graph { None } else { Some("p2f_adj.rkyv") },
             "table_info": "table_info.json",
             "column_index": "column_index.json",
             "text": "text.json",

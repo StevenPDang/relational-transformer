@@ -335,11 +335,12 @@ unsafe impl Sync for VectorDbEntry {}
 struct Dataset {
     mmap: Mmap,
     text_mmap: Mmap,
-    p2f_adj_mmap: Mmap,
+    p2f_adj_mmap: Option<Mmap>,
     offsets: Vec<i64>,
     table_info: HashMap<String, TableInfo>,
     // Opt-in neighborhoods materialized by task-specific, non-recursive SQL.
     sql_contexts: Option<HashMap<i32, Vec<(i32, usize)>>>,
+    sql_seed_order: Option<HashMap<i32, Vec<i32>>>,
     // When `Some`, a deterministic bijection over this database's column
     // indices used to ablate schema semantics: at col_name_values lookup
     // time, the original col_name_idx is replaced by col_name_perm[orig]
@@ -534,6 +535,40 @@ impl Sampler {
             }
         }
         dataset.sql_contexts = Some(contexts);
+        Ok(())
+    }
+
+    /// Replace walk ranking with a SQL-ordered list of historical task rows.
+    fn set_sql_seed_order_py(
+        &mut self,
+        db_name: &str,
+        orders: HashMap<i32, Vec<i32>>,
+    ) -> PyResult<()> {
+        use pyo3::exceptions::PyValueError;
+        let dataset = self.datasets.get_mut(db_name)
+            .ok_or_else(|| PyValueError::new_err("Unknown SQL context database"))?;
+        let contexts = dataset.sql_contexts.as_ref()
+            .ok_or_else(|| PyValueError::new_err("Set SQL contexts before SQL seed order"))?;
+        if contexts.keys().any(|idx| !orders.contains_key(idx)) {
+            return Err(PyValueError::new_err("SQL seed order missing seeds"));
+        }
+        for (&seed, candidates) in &orders {
+            if !contexts.contains_key(&seed) {
+                return Err(PyValueError::new_err("SQL seed order contains unknown seed"));
+            }
+            let source = get_node(dataset, seed);
+            for &idx in candidates {
+                if !contexts.contains_key(&idx) {
+                    return Err(PyValueError::new_err("SQL candidate missing context"));
+                }
+                let node = get_node(dataset, idx);
+                if idx == seed || node.table_name_idx != source.table_name_idx
+                    || node.timestamp >= source.timestamp {
+                    return Err(PyValueError::new_err("SQL candidates must be earlier same-table rows"));
+                }
+            }
+        }
+        dataset.sql_seed_order = Some(orders);
         Ok(())
     }
 
@@ -864,8 +899,20 @@ impl Sampler {
         let offsets = offsets.offsets;
 
         let p2f_adj_path = format!("{}/p2f_adj.rkyv", pre_path);
-        let p2f_adj_file = fs::File::open(&p2f_adj_path).unwrap();
-        let p2f_adj_mmap = unsafe { mmap_opts.map(&p2f_adj_file).unwrap() };
+        let meta_path = format!("{}/meta.json", pre_path);
+        let graph_free = if std::path::Path::new(&meta_path).is_file() {
+            let meta: serde_json::Value =
+                serde_json::from_reader(fs::File::open(meta_path).unwrap()).unwrap();
+            meta["sampling_graph"] == false
+        } else {
+            false // Legacy cell stores always contain the traversal graph.
+        };
+        let p2f_adj_mmap = if graph_free {
+            None
+        } else {
+            let p2f_adj_file = fs::File::open(&p2f_adj_path).unwrap();
+            Some(unsafe { mmap_opts.map(&p2f_adj_file).unwrap() })
+        };
 
         let table_info_path = format!("{}/table_info.json", pre_path);
         let table_info_file = fs::File::open(&table_info_path).unwrap();
@@ -949,6 +996,7 @@ impl Sampler {
                 offsets,
                 table_info,
                 sql_contexts: None,
+                sql_seed_order: None,
                 col_name_perm,
                 #[cfg(feature = "vecdb")]
                 vector_db,
@@ -1214,7 +1262,13 @@ impl Sampler {
         let use_vector_db = self.vector_db_path.is_some();
         #[cfg(not(feature = "vecdb"))]
         let use_vector_db = false;
-        let visit_counts = if !use_vector_db && self.num_walks > 0 {
+        assert!(dataset.p2f_adj_mmap.is_some()
+            || (dataset.sql_contexts.is_some() && dataset.sql_seed_order.is_some()),
+            "Graph-free cells require SQL contexts and SQL seed ordering");
+        let sql_order = dataset.sql_seed_order.as_ref().map(|orders| &orders[&target_node_idx]);
+        let visit_counts = if sql_order.is_some() {
+            HashMap::new()
+        } else if !use_vector_db && self.num_walks > 0 {
             self.compute_visit_counts(
                 dataset,
                 target_node_idx,
@@ -1233,9 +1287,11 @@ impl Sampler {
         // equal-key seeds don't cluster by HashMap iteration order.
         // - prefer_latest=true:  (ts desc, count desc, random)
         // - prefer_latest=false: (count desc, random)
-        let mut visited_sorted: Vec<i32> = visit_counts.keys().copied().collect();
+        let mut visited_sorted: Vec<i32> = sql_order.cloned()
+            .unwrap_or_else(|| visit_counts.keys().copied().collect());
         let priority: HashMap<i32, u64> = visited_sorted
             .iter()
+            .filter(|_| sql_order.is_none())
             .map(|&n| {
                 (
                     n,
@@ -1244,7 +1300,9 @@ impl Sampler {
             })
             .collect();
         check_deadline(deadline);
-        if prefer_latest {
+        if sql_order.is_some() {
+            // Preserve the SQL order; no graph walk or Rust ranking is needed.
+        } else if prefer_latest {
             let ts_of: HashMap<i32, Option<i32>> = visited_sorted
                 .iter()
                 .map(|&n| {
@@ -1512,12 +1570,13 @@ impl Sampler {
                     }
                 }
             }
-            if use_vector_db {
+            if use_vector_db || sql_order.is_some() {
                 // Tier 2 (random same-table fallback) is unreachable when
                 // vector_db is enabled: if the streaming iterator returned
                 // None it already exhausted the table under the same
                 // temporal filter, so any seed Tier 2 would draw is in
-                // tier1_seen and would be skipped.
+                // tier1_seen and would be skipped. SQL also exhausts its
+                // strictly historical candidates; do not add same-time labels.
                 break 'fill_ctx;
             }
             for &n in visit_counts.keys() {
@@ -2331,7 +2390,7 @@ fn get_node(dataset: &Dataset, idx: i32) -> &ArchivedNode {
 }
 
 fn get_p2f_edges(dataset: &Dataset, idx: i32) -> &ArchivedVec<ArchivedEdge> {
-    let bytes = &dataset.p2f_adj_mmap[..];
+    let bytes = &dataset.p2f_adj_mmap.as_ref().expect("BFS requires a sampling graph")[..];
     let p2f_adj = unsafe { rkyv::access_unchecked::<ArchivedAdj>(bytes) };
     &p2f_adj.adj[idx as usize]
 }
