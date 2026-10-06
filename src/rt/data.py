@@ -269,10 +269,13 @@ class RustlerDataset:
                 if setup_timings is not None:
                     setup_timings["Rust seed order transfer and validation"] = time.perf_counter() - tick
             else:
-                from rt.sql_context import load_rel_f1_contexts
+                from rt.sql_context import load_stage2_sql_provider
 
-                contexts = load_rel_f1_contexts(pre_dir, sql_context_db, max(bfs_widths))
-                self.sampler.set_sql_contexts_py("rel-f1", contexts)
+                tick = time.perf_counter()
+                self.sql_neighbor_provider = load_stage2_sql_provider(pre_dir, sql_context_db)
+                self.sampler.set_sql_neighbor_provider_py("rel-f1", self.sql_neighbor_provider)
+                if setup_timings is not None:
+                    setup_timings["SQL Stage 2 source validation"] = time.perf_counter() - tick
 
         self.d_text = d_text
         self.bool_as_num = bool_as_num

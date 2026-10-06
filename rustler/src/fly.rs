@@ -16,6 +16,7 @@ use pyo3::IntoPyObjectExt;
 use pyo3::PyObject;
 use pyo3::PyResult;
 use pyo3::Python;
+use pyo3::types::{PyAnyMethods, PyDictMethods};
 use pyo3::{pyclass, pyfunction, pymethods};
 use rand::prelude::*;
 use rand::seq::index;
@@ -72,6 +73,68 @@ fn fmt_thousands(n: usize) -> String {
 enum BuildError {
     MissingTargetCol,
     NanTargetValue,
+    SqlProvider(pyo3::PyErr),
+}
+
+/// Trace-only legacy policy preserves the pre-alignment baseline for comparison.
+#[derive(Default)]
+struct BuildTrace {
+    legacy: bool,
+    step_seed: u64,
+    local_ctx_size: usize,
+    bfs_width: usize,
+    prefer_latest: bool,
+    balance_labels: bool,
+    mask_prob: f64,
+    visits: Vec<(i32, usize)>,
+    candidates: Vec<i32>,
+    fallback_candidates: Vec<i32>,
+    collections: Vec<CollectionTrace>,
+    cells: Vec<(i32, usize, i32, i32, i32)>,
+}
+
+#[derive(serde::Serialize)]
+struct CollectionTrace {
+    target: i32,
+    target_timestamp: Option<i32>,
+    seed: i32,
+    cutoff: Option<i32>,
+    local_ctx_size: usize,
+    bfs_width: usize,
+    remaining_cells: usize,
+    visited_before: Vec<(i32, usize)>,
+    rows: Vec<(i32, usize)>,
+}
+
+fn sorted_visits(visits: &HashMap<i32, usize>) -> Vec<(i32, usize)> {
+    let mut rows: Vec<_> = visits.iter().map(|(&idx, &count)| (idx, count)).collect();
+    rows.sort_unstable();
+    rows
+}
+
+fn within_cutoff(timestamp: Option<i32>, cutoff: Option<i32>) -> bool {
+    timestamp.is_none() || cutoff.is_none() || timestamp <= cutoff
+}
+
+fn candidate_cmp(
+    a: (usize, Option<i32>, u64, i32),
+    b: (usize, Option<i32>, u64, i32),
+    prefer_latest: bool,
+    legacy: bool,
+) -> std::cmp::Ordering {
+    let score = b.0.cmp(&a.0);
+    let timestamp = if prefer_latest {
+        b.1.cmp(&a.1)
+    } else {
+        std::cmp::Ordering::Equal
+    };
+    (if legacy {
+        timestamp.then(score)
+    } else {
+        score.then(timestamp)
+    })
+    .then_with(|| a.2.cmp(&b.2))
+    .then_with(|| a.3.cmp(&b.3))
 }
 
 #[inline]
@@ -341,6 +404,8 @@ struct Dataset {
     // Opt-in neighborhoods materialized by task-specific, non-recursive SQL.
     sql_contexts: Option<HashMap<i32, Vec<(i32, usize)>>>,
     sql_seed_order: Option<HashMap<i32, Vec<i32>>>,
+    // On-demand Stage 2 only. Never used by Stage 1 or eager/raw SQL contexts.
+    sql_neighbor_provider: Option<PyObject>,
     // When `Some`, a deterministic bijection over this database's column
     // indices used to ablate schema semantics: at col_name_values lookup
     // time, the original col_name_idx is replaced by col_name_perm[orig]
@@ -380,7 +445,7 @@ pub struct Sampler {
     // item from this list. Both branches end with a step_seed-driven
     // random tiebreak so equal-key seeds don't cluster by HashMap
     // iteration order.
-    // True:  (ts desc, count desc, random)
+    // True:  (count desc, ts desc, random)
     // False: (count desc, random)
     // None ts ranks below any Some (std Option ord).
     prefer_latest: Vec<bool>,
@@ -523,6 +588,11 @@ impl Sampler {
         {
             return Err(PyValueError::new_err("SQL context node index out of range"));
         }
+        if dataset.sql_neighbor_provider.is_some() {
+            return Err(PyValueError::new_err(
+                "Clear SQL neighbor provider before installing eager contexts",
+            ));
+        }
         // Every possible same-table seed needs an entry; never silently fall
         // back to BFS when a materialized SQL neighborhood is missing.
         for ((db, _, _, _), &(start, end)) in
@@ -545,16 +615,22 @@ impl Sampler {
         orders: HashMap<i32, Vec<i32>>,
     ) -> PyResult<()> {
         use pyo3::exceptions::PyValueError;
-        let dataset = self.datasets.get_mut(db_name)
+        let dataset = self
+            .datasets
+            .get_mut(db_name)
             .ok_or_else(|| PyValueError::new_err("Unknown SQL context database"))?;
-        let contexts = dataset.sql_contexts.as_ref()
+        let contexts = dataset
+            .sql_contexts
+            .as_ref()
             .ok_or_else(|| PyValueError::new_err("Set SQL contexts before SQL seed order"))?;
         if contexts.keys().any(|idx| !orders.contains_key(idx)) {
             return Err(PyValueError::new_err("SQL seed order missing seeds"));
         }
         for (&seed, candidates) in &orders {
             if !contexts.contains_key(&seed) {
-                return Err(PyValueError::new_err("SQL seed order contains unknown seed"));
+                return Err(PyValueError::new_err(
+                    "SQL seed order contains unknown seed",
+                ));
             }
             let source = get_node(dataset, seed);
             for &idx in candidates {
@@ -562,14 +638,171 @@ impl Sampler {
                     return Err(PyValueError::new_err("SQL candidate missing context"));
                 }
                 let node = get_node(dataset, idx);
-                if idx == seed || node.table_name_idx != source.table_name_idx
-                    || node.timestamp >= source.timestamp {
-                    return Err(PyValueError::new_err("SQL candidates must be earlier same-table rows"));
+                if idx == seed
+                    || node.table_name_idx != source.table_name_idx
+                    || node.timestamp >= source.timestamp
+                {
+                    return Err(PyValueError::new_err(
+                        "SQL candidates must be earlier same-table rows",
+                    ));
                 }
             }
         }
         dataset.sql_seed_order = Some(orders);
         Ok(())
+    }
+
+    /// Install a worker-local callable, or clear it with None. The callable
+    /// returns (f2p, p2f) ordered node-index lists filtered by target cutoff.
+    /// Duplicate edges must be preserved. Forward order follows the encoded
+    /// column/list order; reverse order is (timestamp None first, node_idx).
+    /// Rust verifies identity/order, then consumes SQL IDs with graph metadata.
+    #[pyo3(signature = (db_name, provider))]
+    fn set_sql_neighbor_provider_py(
+        &mut self,
+        py: Python<'_>,
+        db_name: &str,
+        provider: Option<PyObject>,
+    ) -> PyResult<()> {
+        use pyo3::exceptions::PyValueError;
+        let dataset = self
+            .datasets
+            .get_mut(db_name)
+            .ok_or_else(|| PyValueError::new_err("Unknown SQL neighbor database"))?;
+        if let Some(ref provider) = provider {
+            if !provider.bind(py).is_callable() {
+                return Err(PyValueError::new_err(
+                    "SQL neighbor provider must be callable",
+                ));
+            }
+            if dataset.p2f_adj_mmap.is_none()
+                || dataset.sql_contexts.is_some()
+                || dataset.sql_seed_order.is_some()
+            {
+                return Err(PyValueError::new_err(
+                    "SQL neighbor provider requires a graph and no eager SQL contexts/seed order",
+                ));
+            }
+        }
+        dataset.sql_neighbor_provider = provider;
+        Ok(())
+    }
+
+    /// Deterministic single-item build, with no retries, substitution, or step mutation.
+    /// `legacy` is trace-only and reproduces the pre-alignment sampling policy.
+    #[pyo3(signature = (dataset_idx, node_idx, ctx_size, step=0, legacy=false))]
+    fn trace_py(
+        &self,
+        py: Python<'_>,
+        dataset_idx: usize,
+        node_idx: i32,
+        ctx_size: usize,
+        step: u64,
+        legacy: bool,
+    ) -> PyResult<PyObject> {
+        use pyo3::exceptions::{PyRuntimeError, PyValueError};
+        use pyo3::types::PyDict;
+        let (db, table, _, _) = self
+            .dataset_tuples
+            .get(dataset_idx)
+            .ok_or_else(|| PyValueError::new_err("dataset_idx out of range"))?;
+        let (start, end) = self.table_ranges[dataset_idx];
+        if node_idx < start
+            || node_idx >= end
+            || ctx_size == 0
+            || !self.local_ctx_sizes.iter().any(|&l| l <= ctx_size)
+        {
+            return Err(PyValueError::new_err("Invalid trace node or context size"));
+        }
+        if legacy && self.datasets[db].sql_neighbor_provider.is_some() {
+            return Err(PyValueError::new_err(
+                "Legacy trace requires BFS, not SQL neighbor provider",
+            ));
+        }
+        let item = Item {
+            dataset_idx: dataset_idx as i32,
+            node_idx,
+            table_name: table.clone(),
+        };
+        let mut trace = BuildTrace {
+            legacy,
+            ..Default::default()
+        };
+        let mut vecs = Vecs::new(1, ctx_size, self.d_text);
+        let result = py.allow_threads(|| {
+            let mut slices = vecs.chunks_exact_mut(ctx_size, self.d_text).next().unwrap();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.seq_build_traced(
+                    &item,
+                    &mut slices,
+                    step,
+                    ctx_size,
+                    Instant::now() + Duration::from_secs_f64(self.timeout_per_item),
+                    Some(&mut trace),
+                )
+            }))
+        });
+        match result {
+            Ok(Ok(())) => (),
+            Ok(Err(BuildError::SqlProvider(err))) => return Err(err),
+            Ok(Err(err)) => {
+                return Err(PyValueError::new_err(format!(
+                    "Trace build failed: {err:?}"
+                )));
+            }
+            Err(_) => return Err(PyRuntimeError::new_err("Trace build panicked or timed out")),
+        }
+        let out = PyDict::new(py);
+        out.set_item("policy", if legacy { "legacy" } else { "algorithm1" })?;
+        // Fourth baseline alignment: reverse timestamp ties are canonical by
+        // child identity, independent of pre.rs's cross-table HashMap order.
+        out.set_item(
+            "reverse_neighbor_order",
+            if legacy {
+                "stored"
+            } else if self.datasets[db].sql_contexts.is_some() {
+                "not_applicable_eager_sql"
+            } else {
+                "timestamp_none_first_then_node_idx"
+            },
+        )?;
+        out.set_item("target", node_idx)?;
+        out.set_item("step", step)?;
+        out.set_item("step_seed", trace.step_seed)?;
+        out.set_item("context_seed", self.context_seed)?;
+        out.set_item("num_walks", self.num_walks)?;
+        out.set_item("walk_length", self.walk_length)?;
+        out.set_item("local_ctx_size", trace.local_ctx_size)?;
+        out.set_item("bfs_width", trace.bfs_width)?;
+        out.set_item("prefer_latest", trace.prefer_latest)?;
+        out.set_item("balance_labels", trace.balance_labels)?;
+        out.set_item("mask_prob", trace.mask_prob)?;
+        let dataset = &self.datasets[db];
+        out.set_item(
+            "collector",
+            if dataset.sql_neighbor_provider.is_some() {
+                "sql_neighbors"
+            } else if dataset.sql_seed_order.is_some() {
+                "raw_sql"
+            } else if dataset.sql_contexts.is_some() {
+                "eager_sql"
+            } else {
+                "bfs"
+            },
+        )?;
+        out.set_item("visits", trace.visits)?;
+        out.set_item("candidate_order", trace.candidates)?;
+        out.set_item("fallback_candidates", trace.fallback_candidates)?;
+        // JSON round-trip is confined to this diagnostic API, not the sampler hot path.
+        let collections = serde_json::to_string(&trace.collections)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        out.set_item(
+            "collections",
+            py.import("json")?.call_method1("loads", (collections,))?,
+        )?;
+        out.set_item("cells", trace.cells)?;
+        out.set_item("sequence", vecs.into_pyobject(py)?)?;
+        Ok(out.into_any().unbind())
     }
 
     fn batch_py(
@@ -579,15 +812,17 @@ impl Sampler {
         bs: usize,
         ctx_size: usize,
     ) -> PyResult<Vec<PyObject>> {
-        let vecs = match batch_idx {
+        let vecs = py.allow_threads(|| match batch_idx {
             Some(idx) => self.batch(Some(idx), 0, bs, ctx_size),
             None => {
                 let step = self.step;
                 let r = self.batch(None, step, bs, ctx_size);
-                self.step += self.stride;
+                if r.is_ok() {
+                    self.step += self.stride;
+                }
                 r
             }
-        };
+        })?;
         vecs.into_pyobject(py)
     }
 
@@ -605,17 +840,19 @@ impl Sampler {
         let mut vecs = Vecs::new(bs, ctx_size, self.d_text);
         // batch_mask defaults to all true — every slot is real here.
 
-        vecs.chunks_exact_mut(ctx_size, self.d_text)
-            .enumerate()
-            .par_bridge()
-            .for_each(|(i, slices)| {
-                let item = Item {
-                    dataset_idx: dataset_idx as i32,
-                    node_idx: node_idxs[i],
-                    table_name: table_name.clone(),
-                };
-                self.seq(&item, i, slices, 0, ctx_size);
-            });
+        py.allow_threads(|| {
+            vecs.chunks_exact_mut(ctx_size, self.d_text)
+                .enumerate()
+                .par_bridge()
+                .try_for_each(|(i, slices)| {
+                    let item = Item {
+                        dataset_idx: dataset_idx as i32,
+                        node_idx: node_idxs[i],
+                        table_name: table_name.clone(),
+                    };
+                    self.seq(&item, i, slices, 0, ctx_size)
+                })
+        })?;
 
         vecs.into_pyobject(py)
     }
@@ -760,8 +997,7 @@ impl Sampler {
                     for (key, info) in &dataset.table_info {
                         if let Some(colon_pos) = key.rfind(':')
                             && &key[..colon_pos] == table.as_str()
-                            && (!train_only_fallback
-                                || &key[colon_pos + 1..] == "Train")
+                            && (!train_only_fallback || &key[colon_pos + 1..] == "Train")
                         {
                             range_start = range_start.min(info.node_idx_offset);
                             range_end = range_end.max(info.node_idx_offset + info.num_nodes);
@@ -997,6 +1233,7 @@ impl Sampler {
                 table_info,
                 sql_contexts: None,
                 sql_seed_order: None,
+                sql_neighbor_provider: None,
                 col_name_perm,
                 #[cfg(feature = "vecdb")]
                 vector_db,
@@ -1050,7 +1287,13 @@ impl Sampler {
         self.items.len().div_ceil(bs * self.world_size)
     }
 
-    fn batch(&self, batch_idx: Option<usize>, step: u64, bs: usize, ctx_size: usize) -> Vecs {
+    fn batch(
+        &self,
+        batch_idx: Option<usize>,
+        step: u64,
+        bs: usize,
+        ctx_size: usize,
+    ) -> PyResult<Vecs> {
         match batch_idx {
             Some(idx) => {
                 // Eval sharding: each rank takes `bs` items per global batch.
@@ -1089,13 +1332,17 @@ impl Sampler {
                         if j >= self.items.len() {
                             // Phantom slot: leave defaults (fully padded, no
                             // target). batch_mask[i] is already false.
-                            return false;
+                            return Ok(false);
                         }
                         let item = &self.items[j];
                         let deadline = Instant::now() + timeout;
                         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                             || self.seq_build(item, &mut slices, 0, ctx_size, deadline),
                         ));
+                        let caught = match caught {
+                            Ok(Err(BuildError::SqlProvider(err))) => return Err(err),
+                            other => other,
+                        };
                         let failed = !matches!(caught, Ok(Ok(())));
                         if failed {
                             // Reset to a clean padded slot; it becomes a phantom.
@@ -1107,15 +1354,15 @@ impl Sampler {
                                 db_name, item.table_name, item.node_idx
                             );
                         }
-                        failed
+                        Ok(failed)
                     })
-                    .collect();
+                    .collect::<PyResult<Vec<_>>>()?;
                 for (i, &failed) in timed_out.iter().enumerate() {
                     if failed {
                         vecs.batch_mask[i] = false;
                     }
                 }
-                vecs
+                Ok(vecs)
             }
             None => {
                 // Distinct from the (context_seed + step) seed used to derive
@@ -1136,12 +1383,12 @@ impl Sampler {
 
                 vecs.chunks_exact_mut(ctx_size, self.d_text)
                     .enumerate()
-                    .for_each(|(i, slices)| {
+                    .try_for_each(|(i, slices)| {
                         let j = self.global_rank * bs + i;
                         let item = &self.items[global_indices[j]];
-                        self.seq(item, global_indices[j], slices, step, ctx_size);
-                    });
-                vecs
+                        self.seq(item, global_indices[j], slices, step, ctx_size)
+                    })?;
+                Ok(vecs)
             }
         }
     }
@@ -1151,7 +1398,14 @@ impl Sampler {
     /// per-item wall-clock budget bounds each `seq_build` call: when it
     /// expires the call panics with a timeout message, which falls into the
     /// red-warning-and-retry branch like any other panic.
-    fn seq(&self, item: &Item, item_idx: usize, mut slices: Slices, step: u64, ctx_len: usize) {
+    fn seq(
+        &self,
+        item: &Item,
+        item_idx: usize,
+        mut slices: Slices,
+        step: u64,
+        ctx_len: usize,
+    ) -> PyResult<()> {
         let mut current_item = item;
         let mut retry_seed = item_idx as u64;
         let timeout = Duration::from_secs_f64(self.timeout_per_item);
@@ -1161,7 +1415,8 @@ impl Sampler {
                 self.seq_build(current_item, &mut slices, step, ctx_len, deadline)
             }));
             match caught {
-                Ok(Ok(())) => break,
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(BuildError::SqlProvider(err))) => return Err(err),
                 Ok(Err(_)) => {}
                 Err(panic_info) => {
                     let msg = panic_info
@@ -1193,6 +1448,19 @@ impl Sampler {
         ctx_len: usize,
         deadline: Instant,
     ) -> Result<(), BuildError> {
+        self.seq_build_traced(item, slices, step, ctx_len, deadline, None)
+    }
+
+    fn seq_build_traced(
+        &self,
+        item: &Item,
+        slices: &mut Slices,
+        step: u64,
+        ctx_len: usize,
+        deadline: Instant,
+        mut trace: Option<&mut BuildTrace>,
+    ) -> Result<(), BuildError> {
+        let legacy = trace.as_ref().is_some_and(|t| t.legacy);
         check_deadline(deadline);
         let db_name = &self.dataset_tuples[item.dataset_idx as usize].0;
         let dataset = &self.datasets[db_name];
@@ -1253,7 +1521,16 @@ impl Sampler {
         let prefer_latest = self.prefer_latest[seq_rng.random_range(0..self.prefer_latest.len())];
         let balance_labels =
             self.balance_labels[seq_rng.random_range(0..self.balance_labels.len())];
+        if let Some(t) = trace.as_deref_mut() {
+            t.step_seed = step_seed;
+            t.local_ctx_size = local_ctx_size;
+            t.bfs_width = bfs_width;
+            t.prefer_latest = prefer_latest;
+            t.balance_labels = balance_labels;
+            t.mask_prob = mask_prob;
+        }
 
+        // Stage 1 is fully computed before any collector can consume BFS RNG.
         // Step 1: walk visit counts (skip when num_walks == 0; that's
         // pure random_same_table mode — every same-table node falls through
         // to the unvisited-tier). Also skipped when vector_db_path is set:
@@ -1262,10 +1539,15 @@ impl Sampler {
         let use_vector_db = self.vector_db_path.is_some();
         #[cfg(not(feature = "vecdb"))]
         let use_vector_db = false;
-        assert!(dataset.p2f_adj_mmap.is_some()
-            || (dataset.sql_contexts.is_some() && dataset.sql_seed_order.is_some()),
-            "Graph-free cells require SQL contexts and SQL seed ordering");
-        let sql_order = dataset.sql_seed_order.as_ref().map(|orders| &orders[&target_node_idx]);
+        assert!(
+            dataset.p2f_adj_mmap.is_some()
+                || (dataset.sql_contexts.is_some() && dataset.sql_seed_order.is_some()),
+            "Graph-free cells require SQL contexts and SQL seed ordering"
+        );
+        let sql_order = dataset
+            .sql_seed_order
+            .as_ref()
+            .map(|orders| &orders[&target_node_idx]);
         let visit_counts = if sql_order.is_some() {
             HashMap::new()
         } else if !use_vector_db && self.num_walks > 0 {
@@ -1277,6 +1559,7 @@ impl Sampler {
                 self.walk_length,
                 step_seed,
                 deadline,
+                legacy,
             )
         } else {
             HashMap::new()
@@ -1285,9 +1568,10 @@ impl Sampler {
         // Step 2: order visited same-table seeds. Both branches use a
         // step_seed-derived random priority as the final tiebreak so that
         // equal-key seeds don't cluster by HashMap iteration order.
-        // - prefer_latest=true:  (ts desc, count desc, random)
+        // - prefer_latest=true:  (count desc, ts desc, random)
         // - prefer_latest=false: (count desc, random)
-        let mut visited_sorted: Vec<i32> = sql_order.cloned()
+        let mut visited_sorted: Vec<i32> = sql_order
+            .cloned()
             .unwrap_or_else(|| visit_counts.keys().copied().collect());
         let priority: HashMap<i32, u64> = visited_sorted
             .iter()
@@ -1302,7 +1586,7 @@ impl Sampler {
         check_deadline(deadline);
         if sql_order.is_some() {
             // Preserve the SQL order; no graph walk or Rust ranking is needed.
-        } else if prefer_latest {
+        } else {
             let ts_of: HashMap<i32, Option<i32>> = visited_sorted
                 .iter()
                 .map(|&n| {
@@ -1311,19 +1595,22 @@ impl Sampler {
                 })
                 .collect();
             visited_sorted.sort_by(|a, b| {
-                ts_of[b]
-                    .cmp(&ts_of[a])
-                    .then_with(|| visit_counts[b].cmp(&visit_counts[a]))
-                    .then_with(|| priority[a].cmp(&priority[b]))
-            });
-        } else {
-            visited_sorted.sort_by(|a, b| {
-                visit_counts[b]
-                    .cmp(&visit_counts[a])
-                    .then_with(|| priority[a].cmp(&priority[b]))
+                candidate_cmp(
+                    (visit_counts[a], ts_of[a], priority[a], *a),
+                    (visit_counts[b], ts_of[b], priority[b], *b),
+                    prefer_latest,
+                    legacy,
+                )
             });
         }
         check_deadline(deadline);
+
+        if let Some(t) = trace.as_deref_mut() {
+            t.visits = sorted_visits(&visit_counts);
+            t.candidates = std::iter::once(target_node_idx)
+                .chain(visited_sorted.iter().copied())
+                .collect();
+        }
 
         // Step 3: same-table fallback iterator. Lazy — only materialized when
         // the visited tier runs dry. Streams unvisited nodes from the target's
@@ -1389,7 +1676,9 @@ impl Sampler {
                 &mut visited_in_ctx,
                 &mut cells_to_add,
                 deadline,
-            ) {
+                legacy,
+                &mut trace,
+            )? {
                 break 'fill_ctx;
             }
 
@@ -1408,33 +1697,78 @@ impl Sampler {
             if use_vector_db {
                 #[cfg(feature = "vecdb")]
                 {
-                let entry = dataset
-                    .vector_db
-                    .as_ref()
-                    .expect("vector_db_path is set but dataset.vector_db was not loaded")
-                    .get(item.table_name.as_str())
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "vector_db has no FAISS entry for table '{}'",
-                            item.table_name
-                        )
-                    });
-                let mut vdb = VectorDbStream::new(entry, target_node_idx, target_node);
-                if balance_labels {
-                    // Lazy variant: pull-classify-drain on demand. The 50/50
-                    // alternation runs over whatever's already materialized
-                    // in neg / pos, so the realized pattern depends on
-                    // iterator order — distinct from the upfront-partition
-                    // path but consistent with the lazy-retrieval contract.
-                    let mut neg: Vec<i32> = Vec::new();
-                    let mut pos: Vec<i32> = Vec::new();
-                    let mut neg_i = 0;
-                    let mut pos_i = 0;
-                    loop {
-                        if let Some(seed_node_idx) =
-                            pick_balanced(&neg, &pos, &mut neg_i, &mut pos_i, &mut balance_rng)
-                        {
+                    let entry = dataset
+                        .vector_db
+                        .as_ref()
+                        .expect("vector_db_path is set but dataset.vector_db was not loaded")
+                        .get(item.table_name.as_str())
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "vector_db has no FAISS entry for table '{}'",
+                                item.table_name
+                            )
+                        });
+                    let mut vdb = VectorDbStream::new(entry, target_node_idx, target_node);
+                    if balance_labels {
+                        // Lazy variant: pull-classify-drain on demand. The 50/50
+                        // alternation runs over whatever's already materialized
+                        // in neg / pos, so the realized pattern depends on
+                        // iterator order — distinct from the upfront-partition
+                        // path but consistent with the lazy-retrieval contract.
+                        let mut neg: Vec<i32> = Vec::new();
+                        let mut pos: Vec<i32> = Vec::new();
+                        let mut neg_i = 0;
+                        let mut pos_i = 0;
+                        loop {
+                            if let Some(seed_node_idx) =
+                                pick_balanced(&neg, &pos, &mut neg_i, &mut pos_i, &mut balance_rng)
+                            {
+                                check_deadline(deadline);
+                                if extend_with_seed_bfs(
+                                    self,
+                                    dataset,
+                                    seed_node_idx,
+                                    target_node_idx,
+                                    target_node,
+                                    target_column,
+                                    columns_to_drop,
+                                    local_ctx_size,
+                                    bfs_width,
+                                    ctx_len,
+                                    &mut bfs_rng,
+                                    &mut visited_at_depth,
+                                    &mut visited_in_ctx,
+                                    &mut cells_to_add,
+                                    deadline,
+                                    legacy,
+                                    &mut trace,
+                                )? {
+                                    break 'fill_ctx;
+                                }
+                                continue;
+                            }
                             check_deadline(deadline);
+                            match vdb.next(dataset) {
+                                None => break,
+                                Some(seed_node_idx) => {
+                                    let seed_node = get_node(dataset, seed_node_idx);
+                                    if seed_label_missing(seed_node, target_column) {
+                                        continue;
+                                    }
+                                    if seed_label_is_negative(seed_node, target_column) {
+                                        neg.push(seed_node_idx);
+                                    } else {
+                                        pos.push(seed_node_idx);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        while let Some(seed_node_idx) = vdb.next(dataset) {
+                            check_deadline(deadline);
+                            if seed_label_missing(get_node(dataset, seed_node_idx), target_column) {
+                                continue;
+                            }
                             if extend_with_seed_bfs(
                                 self,
                                 dataset,
@@ -1451,54 +1785,13 @@ impl Sampler {
                                 &mut visited_in_ctx,
                                 &mut cells_to_add,
                                 deadline,
-                            ) {
+                                legacy,
+                                &mut trace,
+                            )? {
                                 break 'fill_ctx;
                             }
-                            continue;
-                        }
-                        check_deadline(deadline);
-                        match vdb.next(dataset) {
-                            None => break,
-                            Some(seed_node_idx) => {
-                                let seed_node = get_node(dataset, seed_node_idx);
-                                if seed_label_missing(seed_node, target_column) {
-                                    continue;
-                                }
-                                if seed_label_is_negative(seed_node, target_column) {
-                                    neg.push(seed_node_idx);
-                                } else {
-                                    pos.push(seed_node_idx);
-                                }
-                            }
                         }
                     }
-                } else {
-                    while let Some(seed_node_idx) = vdb.next(dataset) {
-                        check_deadline(deadline);
-                        if seed_label_missing(get_node(dataset, seed_node_idx), target_column) {
-                            continue;
-                        }
-                        if extend_with_seed_bfs(
-                            self,
-                            dataset,
-                            seed_node_idx,
-                            target_node_idx,
-                            target_node,
-                            target_column,
-                            columns_to_drop,
-                            local_ctx_size,
-                            bfs_width,
-                            ctx_len,
-                            &mut bfs_rng,
-                            &mut visited_at_depth,
-                            &mut visited_in_ctx,
-                            &mut cells_to_add,
-                            deadline,
-                        ) {
-                            break 'fill_ctx;
-                        }
-                    }
-                }
                 }
             } else if balance_labels {
                 let mut neg: Vec<i32> = Vec::new();
@@ -1539,7 +1832,9 @@ impl Sampler {
                         &mut visited_in_ctx,
                         &mut cells_to_add,
                         deadline,
-                    ) {
+                        legacy,
+                        &mut trace,
+                    )? {
                         break 'fill_ctx;
                     }
                 }
@@ -1565,7 +1860,9 @@ impl Sampler {
                         &mut visited_in_ctx,
                         &mut cells_to_add,
                         deadline,
-                    ) {
+                        legacy,
+                        &mut trace,
+                    )? {
                         break 'fill_ctx;
                     }
                 }
@@ -1600,6 +1897,12 @@ impl Sampler {
             }
             let mut fallback_rng = StdRng::seed_from_u64(fallback_seed);
             let fallback_offsets = index::sample(&mut fallback_rng, total_table, fallback_amount);
+            if let Some(t) = trace.as_deref_mut() {
+                t.fallback_candidates = fallback_offsets
+                    .iter()
+                    .map(|off| range_start + off as i32)
+                    .collect();
+            }
             check_deadline(deadline);
             if balance_labels {
                 // Materialize valid candidates into neg/pos buckets, preserving
@@ -1655,7 +1958,9 @@ impl Sampler {
                         &mut visited_in_ctx,
                         &mut cells_to_add,
                         deadline,
-                    ) {
+                        legacy,
+                        &mut trace,
+                    )? {
                         break 'fill_ctx;
                     }
                 }
@@ -1697,11 +2002,17 @@ impl Sampler {
                         &mut visited_in_ctx,
                         &mut cells_to_add,
                         deadline,
-                    ) {
+                        legacy,
+                        &mut trace,
+                    )? {
                         break 'fill_ctx;
                     }
                 }
             }
+        }
+
+        if let Some(t) = trace.as_deref_mut() {
+            t.cells = cells_to_add.clone();
         }
 
         // Add cells to sequence. Distinct stream from seq_rng — both pull
@@ -1756,6 +2067,7 @@ impl Sampler {
         max_walk_length: usize,
         step_seed: u64,
         deadline: Instant,
+        legacy: bool,
     ) -> HashMap<i32, usize> {
         // Distinct stream from the other (step_seed + target_node_idx)
         // RNGs in seq_build (source_idx == target_node_idx at every call
@@ -1775,6 +2087,14 @@ impl Sampler {
 
             // Perform a random walk
             for _ in 0..max_walk_length {
+                check_deadline(deadline);
+                // Algorithm 1 counts the destination, including the final move.
+                if !legacy {
+                    match self.select_random_neighbor(dataset, current_idx, source_node, &mut rng) {
+                        Some(idx) => current_idx = idx,
+                        None => break,
+                    }
+                }
                 let current_node = get_node(dataset, current_idx);
 
                 // Count this step iff:
@@ -1792,7 +2112,10 @@ impl Sampler {
                     }
                 }
 
-                // Select next node randomly
+                if !legacy {
+                    continue;
+                }
+                // Legacy baseline counts before moving.
                 let next_idx = match self.select_random_neighbor(
                     dataset,
                     current_idx,
@@ -1934,12 +2257,14 @@ impl Sampler {
         &self,
         dataset: &Dataset,
         start_idx: i32,
+        target_idx: i32,
+        legacy: bool,
         rng: &mut StdRng,
         local_ctx_size: usize,
         bfs_width: usize,
         visited_at_depth: &mut HashMap<i32, usize>,
         deadline: Instant,
-    ) -> Vec<(i32, usize)> {
+    ) -> Result<Vec<(i32, usize)>, BuildError> {
         if let Some(contexts) = &dataset.sql_contexts {
             let nodes = contexts.get(&start_idx).expect("SQL context missing seed");
             let seed = get_node(dataset, start_idx);
@@ -1966,11 +2291,13 @@ impl Sampler {
                 visited_at_depth.insert(idx, depth);
                 result.push((idx, depth));
             }
-            return result;
+            return Ok(result);
         }
         let mut result: Vec<(i32, usize)> = Vec::with_capacity(128);
 
         let start_node = get_node(dataset, start_idx);
+        let cutoff_node = get_node(dataset, if legacy { start_idx } else { target_idx });
+        let cutoff: Option<i32> = cutoff_node.timestamp.as_ref().map(|t| (*t).into());
         let mut num_cells = 0;
 
         // Two frontier data structures:
@@ -1987,7 +2314,7 @@ impl Sampler {
                 f2p_ftr.pop().unwrap()
             } else {
                 match p2f_ftr.iter().position(|v| !v.is_empty()) {
-                    None => return result,
+                    None => return Ok(result),
                     Some(depth) => {
                         let r = rng.random_range(0..p2f_ftr[depth].len());
                         let l = p2f_ftr[depth].len();
@@ -2006,11 +2333,14 @@ impl Sampler {
             }
 
             let node = get_node(dataset, node_idx);
+            if !legacy && !within_cutoff(node.timestamp.as_ref().map(|t| (*t).into()), cutoff) {
+                continue;
+            }
 
             // Update number of cells collected
             num_cells += node.col_name_idxs.len();
             if num_cells >= local_ctx_size {
-                return result;
+                return Ok(result);
             }
 
             // Record the depth at which this node was visited
@@ -2018,27 +2348,32 @@ impl Sampler {
 
             result.push((node_idx, depth));
 
-            // Add f2p edges to f2p frontier
-            for edge in node.f2p_edges.iter() {
-                f2p_ftr.push((depth + 1, edge.node_idx.into()));
-            }
+            // Query at most once per collected/popped node, never per edge.
+            // The same ordered edge lists drive both collectors below.
+            let (f2p_edges, p2f_edges) = if legacy {
+                let p2f = get_p2f_edges(dataset, node_idx);
+                let valid = p2f.as_slice().partition_point(|edge| {
+                    edge.timestamp.is_none()
+                        || (start_node.timestamp.is_some()
+                            && edge.timestamp <= start_node.timestamp)
+                });
+                (
+                    Stage2Edges::from_graph(node.f2p_edges.iter().collect()),
+                    Stage2Edges::from_graph(p2f.as_slice()[..valid].iter().collect()),
+                )
+            } else {
+                ordered_stage2_edges(dataset, node_idx, target_idx, start_idx, cutoff)?
+            };
 
-            // Get p2f edges and process them
-            let p2f_edges = get_p2f_edges(dataset, node_idx);
+            // Add f2p edges to f2p frontier
+            for (neighbor_idx, _) in f2p_edges.iter() {
+                f2p_ftr.push((depth + 1, neighbor_idx));
+            }
 
             // Reuse pre-allocated storage for db edges to be subsampled
             db_p2f_ftr.clear();
 
-            // The edges are sorted by timestamp, so we can binary search to find valid ones
-            let valid_edges = p2f_edges.as_slice().partition_point(|edge| {
-                edge.timestamp.is_none()
-                    || (start_node.timestamp.is_some() && edge.timestamp <= start_node.timestamp)
-            });
-
-            // Filter valid edges by table constraints
-            let p2f_edges = &p2f_edges.as_slice()[..valid_edges];
-
-            for (i, edge) in p2f_edges.iter().enumerate() {
+            for (i, (neighbor_idx, edge)) in p2f_edges.iter().enumerate() {
                 if i & (DEADLINE_CHECK_EVERY - 1) == 0 {
                     check_deadline(deadline);
                 }
@@ -2050,7 +2385,7 @@ impl Sampler {
                 }
 
                 if edge.table_type == ArchivedTableType::Db {
-                    db_p2f_ftr.push(edge.node_idx.into());
+                    db_p2f_ftr.push(neighbor_idx);
                     continue;
                 }
 
@@ -2059,7 +2394,7 @@ impl Sampler {
                         p2f_ftr.push(vec![]);
                     }
                 }
-                p2f_ftr[depth + 1].push(edge.node_idx.into());
+                p2f_ftr[depth + 1].push(neighbor_idx);
             }
 
             // Subsample DB edges based on bfs_width
@@ -2079,6 +2414,109 @@ impl Sampler {
             }
         }
     }
+}
+
+/// Exact adjacency contract: no omissions, extra nodes, reordering, or lost
+/// duplicate edges. Checking against the graph is deliberate: Stage 1 still
+/// needs that graph, and SQL data must map to the same prepared revision.
+fn validate_neighbor_order(actual: &[i32], expected: &[i32]) -> PyResult<()> {
+    if actual != expected {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "SQL neighbors differ from encoded graph identity/order/target cutoff",
+        ));
+    }
+    Ok(())
+}
+
+/// Owned neighbor identities drive the frontier; graph edges supply only
+/// trusted table/type/time metadata. Keeping IDs separate makes the SQL result
+/// an input to traversal, rather than a verification-only side effect.
+struct Stage2Edges<'a> {
+    node_idxs: Vec<i32>,
+    metadata: Vec<&'a ArchivedEdge>,
+}
+
+impl<'a> Stage2Edges<'a> {
+    fn from_graph(metadata: Vec<&'a ArchivedEdge>) -> Self {
+        let node_idxs = metadata.iter().map(|e| e.node_idx.into()).collect();
+        Self {
+            node_idxs,
+            metadata,
+        }
+    }
+
+    fn from_sql(node_idxs: Vec<i32>, metadata: Vec<&'a ArchivedEdge>) -> PyResult<Self> {
+        let expected: Vec<i32> = metadata.iter().map(|e| e.node_idx.into()).collect();
+        validate_neighbor_order(&node_idxs, &expected)?;
+        // Exact ordered validation makes this an occurrence-by-occurrence
+        // mapping, not a set/map lookup that could collapse duplicate edges.
+        Ok(Self {
+            node_idxs,
+            metadata,
+        })
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (i32, &'a ArchivedEdge)> + '_ {
+        self.node_idxs
+            .iter()
+            .copied()
+            .zip(self.metadata.iter().copied())
+    }
+}
+
+fn ordered_stage2_edges<'a>(
+    dataset: &'a Dataset,
+    node_idx: i32,
+    target_idx: i32,
+    seed_idx: i32,
+    cutoff: Option<i32>,
+) -> Result<(Stage2Edges<'a>, Stage2Edges<'a>), BuildError> {
+    let eligible = |edge: &&ArchivedEdge| {
+        let neighbor_idx: i32 = edge.node_idx.into();
+        within_cutoff(edge.timestamp.as_ref().map(|t| (*t).into()), cutoff)
+            && within_cutoff(
+                get_node(dataset, neighbor_idx)
+                    .timestamp
+                    .as_ref()
+                    .map(|t| (*t).into()),
+                cutoff,
+            )
+    };
+    let node = get_node(dataset, node_idx);
+    let f2p: Vec<_> = node.f2p_edges.iter().filter(eligible).collect();
+    let reverse = get_p2f_edges(dataset, node_idx);
+    // Reverse edges are timestamp-sorted; do not scan the future suffix.
+    let valid = reverse.as_slice().partition_point(|edge| {
+        within_cutoff(edge.timestamp.as_ref().map(|t| (*t).into()), cutoff)
+    });
+    let mut p2f: Vec<_> = reverse.as_slice()[..valid]
+        .iter()
+        .filter(eligible)
+        .collect();
+    // Fourth aligned-baseline policy: canonical reverse adjacency removes
+    // equal/null timestamp tie order inherited from pre.rs HashMap iteration.
+    // Stable sort preserves duplicate occurrences; forward order is untouched.
+    p2f.sort_by_key(|edge| {
+        (
+            edge.timestamp.as_ref().map(|t| i32::from(*t)),
+            i32::from(edge.node_idx),
+        )
+    });
+    if let Some(provider) = &dataset.sql_neighbor_provider {
+        let (actual_f2p, actual_p2f) = Python::with_gil(|py| -> PyResult<(Vec<i32>, Vec<i32>)> {
+            let (actual_f2p, actual_p2f): (Vec<i32>, Vec<i32>) = provider
+                .bind(py)
+                .call1((node_idx, target_idx, seed_idx, cutoff))?
+                .extract()?;
+            Ok((actual_f2p, actual_p2f))
+        })
+        .map_err(BuildError::SqlProvider)?;
+        return Ok((
+            Stage2Edges::from_sql(actual_f2p, f2p).map_err(BuildError::SqlProvider)?,
+            Stage2Edges::from_sql(actual_p2f, p2f).map_err(BuildError::SqlProvider)?,
+        ));
+    }
+    Ok((Stage2Edges::from_graph(f2p), Stage2Edges::from_graph(p2f)))
 }
 
 /// BFS-expand around `seed_node_idx` and append cells to `cells_to_add` until
@@ -2106,16 +2544,46 @@ fn extend_with_seed_bfs(
     visited_in_ctx: &mut HashSet<i32>,
     cells_to_add: &mut Vec<(i32, usize, i32, i32, i32)>,
     deadline: Instant,
-) -> bool {
+    legacy: bool,
+    trace: &mut Option<&mut BuildTrace>,
+) -> Result<bool, BuildError> {
+    if cells_to_add.len() >= ctx_len {
+        return Ok(true);
+    }
+    let visited_before = trace.as_ref().map(|_| sorted_visits(visited_at_depth));
+    let remaining_cells = ctx_len.saturating_sub(cells_to_add.len());
     let bfs_nodes = sampler.bfs_collect_nodes(
         dataset,
         seed_node_idx,
+        target_node_idx,
+        legacy,
         bfs_rng,
         local_ctx_size,
         bfs_width,
         visited_at_depth,
         deadline,
-    );
+    )?;
+    if let Some(t) = trace.as_deref_mut() {
+        let cutoff_node = get_node(
+            dataset,
+            if legacy || dataset.sql_contexts.is_some() {
+                seed_node_idx
+            } else {
+                target_node_idx
+            },
+        );
+        t.collections.push(CollectionTrace {
+            target: target_node_idx,
+            target_timestamp: target_node.timestamp.as_ref().map(|t| (*t).into()),
+            seed: seed_node_idx,
+            cutoff: cutoff_node.timestamp.as_ref().map(|t| (*t).into()),
+            local_ctx_size,
+            bfs_width,
+            remaining_cells,
+            visited_before: visited_before.unwrap(),
+            rows: bfs_nodes.clone(),
+        });
+    }
 
     for (bfs_node_idx, depth) in bfs_nodes {
         check_deadline(deadline);
@@ -2153,11 +2621,11 @@ fn extend_with_seed_bfs(
             cells_to_add.push((bfs_node_idx, cell_i, col_idx, seed_node_idx, depth as i32));
 
             if cells_to_add.len() == ctx_len {
-                return true;
+                return Ok(true);
             }
         }
     }
-    false
+    Ok(false)
 }
 
 /// Lazy iterator over FAISS-similarity neighbors of a target node, used as
@@ -2390,7 +2858,10 @@ fn get_node(dataset: &Dataset, idx: i32) -> &ArchivedNode {
 }
 
 fn get_p2f_edges(dataset: &Dataset, idx: i32) -> &ArchivedVec<ArchivedEdge> {
-    let bytes = &dataset.p2f_adj_mmap.as_ref().expect("BFS requires a sampling graph")[..];
+    let bytes = &dataset
+        .p2f_adj_mmap
+        .as_ref()
+        .expect("BFS requires a sampling graph")[..];
     let p2f_adj = unsafe { rkyv::access_unchecked::<ArchivedAdj>(bytes) };
     &p2f_adj.adj[idx as usize]
 }
@@ -2450,8 +2921,7 @@ pub fn column_sem_types(pre_dir: String, db_name: String) -> PyResult<HashMap<St
         serde_json::from_reader(BufReader::new(f))
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
     };
-    let idx_to_name: HashMap<i32, &String> =
-        column_index.iter().map(|(k, v)| (*v, k)).collect();
+    let idx_to_name: HashMap<i32, &String> = column_index.iter().map(|(k, v)| (*v, k)).collect();
 
     let mut out: HashMap<String, String> = HashMap::new();
     for info in table_info.values() {
@@ -2535,6 +3005,558 @@ pub struct Cli {
     num_trials: usize,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::{Adj, Edge, Node, SemType, TableType};
+    use pyo3::types::PyDict;
+
+    fn mmap(bytes: &[u8]) -> Mmap {
+        let mut map = memmap2::MmapMut::map_anon(bytes.len().max(8)).unwrap();
+        map[..bytes.len()].copy_from_slice(bytes);
+        map.make_read_only().unwrap()
+    }
+
+    fn node(idx: i32, table: i32, timestamp: Option<i32>) -> Node {
+        Node {
+            node_idx: idx,
+            table_name_idx: table,
+            timestamp,
+            is_task_node: table == 0,
+            col_name_idxs: vec![0, 1],
+            sem_types: vec![SemType::Number, SemType::Number],
+            number_values: vec![idx as f32, 1.0],
+            text_values: vec![0; 2],
+            datetime_values: vec![0.0; 2],
+            boolean_values: vec![0.0; 2],
+            class_value_idx: vec![0; 2],
+            ..Default::default()
+        }
+    }
+
+    fn edge(n: &Node) -> Edge {
+        Edge {
+            node_idx: n.node_idx,
+            table_name_idx: n.table_name_idx,
+            timestamp: n.timestamp,
+            table_type: if n.table_name_idx == 0 {
+                TableType::Train
+            } else {
+                TableType::Db
+            },
+        }
+    }
+
+    fn fixture() -> Sampler {
+        // Historical seed 1 reaches rows at 7/9/10 through timeless DB node 4.
+        // Equal target time is valid; future 3/7 are not. Duplicate edge 5
+        // tests visited-depth dedup; DB width sampling is exercised at node 4.
+        let mut nodes = vec![
+            node(0, 0, Some(10)),
+            node(1, 0, Some(5)),
+            node(2, 0, Some(10)),
+            node(3, 0, Some(11)),
+            node(4, 1, None),
+            node(5, 1, Some(7)),
+            node(6, 1, Some(9)),
+            node(7, 1, Some(11)),
+        ];
+        nodes[0].f2p_edges = vec![edge(&nodes[4])];
+        nodes[1].f2p_edges = vec![edge(&nodes[4])];
+        // A future forward edge must also be rejected, not just reverse edges.
+        nodes[2].f2p_edges = vec![edge(&nodes[7])];
+        let mut adj = vec![vec![]; nodes.len()];
+        adj[4] = [1, 5, 5, 6, 0, 2, 3, 7]
+            .iter()
+            .map(|&i| edge(&nodes[i]))
+            .collect();
+        let mut bytes = Vec::new();
+        let mut offsets = vec![0];
+        for n in &nodes {
+            bytes.extend_from_slice(&rkyv::to_bytes::<Error>(n).unwrap());
+            offsets.push(bytes.len() as i64);
+        }
+        let dataset = Dataset {
+            mmap: mmap(&bytes),
+            text_mmap: mmap(&[0; 8]),
+            p2f_adj_mmap: Some(mmap(&rkyv::to_bytes::<Error>(&Adj { adj }).unwrap())),
+            offsets,
+            table_info: HashMap::new(),
+            sql_contexts: None,
+            sql_seed_order: None,
+            sql_neighbor_provider: None,
+            col_name_perm: None,
+            #[cfg(feature = "vecdb")]
+            vector_db: None,
+        };
+        Sampler {
+            global_rank: 0,
+            local_rank: 0,
+            world_size: 1,
+            datasets: HashMap::from([("fixture".into(), dataset)]),
+            items: vec![Item {
+                dataset_idx: 0,
+                node_idx: 0,
+                table_name: "task".into(),
+            }],
+            local_ctx_sizes: vec![8],
+            bfs_widths: vec![1],
+            num_walks: 12,
+            walk_length: 4,
+            prefer_latest: vec![true],
+            mask_prob_max: 0.0,
+            step: 0,
+            stride: 1,
+            d_text: 1,
+            shuffle_seed: 0,
+            context_seed: 42,
+            target_columns: vec![0],
+            columns_to_drop: vec![vec![0]],
+            items_per_task: -1,
+            dataset_tuples: vec![("fixture".into(), "task".into(), 0, 4)],
+            table_ranges: vec![(0, 4)],
+            quiet: true,
+            skip_text_cols: false,
+            balance_labels: vec![false],
+            timeout_per_item: 10.0,
+            vector_db_path: None,
+        }
+    }
+
+    fn build(sampler: &Sampler, ctx_len: usize, legacy: bool) -> (BuildTrace, Vecs) {
+        let mut trace = BuildTrace {
+            legacy,
+            ..Default::default()
+        };
+        let mut vecs = Vecs::new(1, ctx_len, sampler.d_text);
+        let mut slices = vecs
+            .chunks_exact_mut(ctx_len, sampler.d_text)
+            .next()
+            .unwrap();
+        sampler
+            .seq_build_traced(
+                &sampler.items[0],
+                &mut slices,
+                0,
+                ctx_len,
+                Instant::now() + Duration::from_secs(10),
+                Some(&mut trace),
+            )
+            .unwrap();
+        (trace, vecs)
+    }
+
+    #[test]
+    fn algorithm1_counts_after_move_including_final_destination() {
+        let s = fixture();
+        let d = &s.datasets["fixture"];
+        // Node 4 -> task node 1 is forced by making all other reverse edges future
+        // relative to seed 1. The second/final move must count node 1.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let legacy = s.compute_visit_counts(d, 1, get_node(d, 1), 1, 2, 42, deadline, true);
+        let aligned = s.compute_visit_counts(d, 1, get_node(d, 1), 1, 2, 42, deadline, false);
+        // Source itself remains excluded under both policies.
+        assert!(legacy.is_empty());
+        assert!(aligned.is_empty());
+        // From target 0, a walk's final destination contributes after the move.
+        let legacy = s.compute_visit_counts(d, 0, get_node(d, 0), 100, 2, 42, deadline, true);
+        let aligned = s.compute_visit_counts(d, 0, get_node(d, 0), 100, 2, 42, deadline, false);
+        assert!(legacy.is_empty());
+        assert!(!aligned.is_empty());
+        assert!(!aligned.contains_key(&0));
+        assert!(!aligned.contains_key(&3));
+        assert_eq!(
+            aligned,
+            s.compute_visit_counts(d, 0, get_node(d, 0), 100, 2, 42, deadline, false)
+        );
+    }
+
+    #[test]
+    fn legacy_trace_preserves_pre_alignment_fixture() {
+        let s = fixture();
+        let (trace, _) = build(&s, 12, true);
+        assert_eq!(trace.visits, vec![(1, 2), (2, 2)]);
+        assert_eq!(trace.candidates, vec![0, 2, 1]);
+        assert_eq!(trace.fallback_candidates, vec![2]);
+        assert_eq!(
+            serde_json::to_value(&trace.collections).unwrap(),
+            serde_json::json!([
+                {"target":0,"target_timestamp":10,"seed":0,"cutoff":10,"local_ctx_size":8,"bfs_width":1,
+                 "remaining_cells":11,"visited_before":[],"rows":[[0,0],[4,1],[5,2]]},
+                {"target":0,"target_timestamp":10,"seed":2,"cutoff":10,"local_ctx_size":8,"bfs_width":1,
+                 "remaining_cells":6,"visited_before":[[0,0],[4,1],[5,2]],"rows":[[2,0],[7,1]]},
+                {"target":0,"target_timestamp":10,"seed":1,"cutoff":5,"local_ctx_size":8,"bfs_width":1,
+                 "remaining_cells":3,"visited_before":[[0,0],[2,0],[4,1],[5,2],[7,1]],"rows":[[1,0]]}
+            ])
+        );
+        assert_eq!(
+            trace.cells,
+            vec![
+                (0, 0, 0, 0, 0),
+                (0, 1, 1, 0, 0),
+                (4, 0, 0, 0, 1),
+                (4, 1, 1, 0, 1),
+                (5, 0, 0, 0, 2),
+                (5, 1, 1, 0, 2),
+                (2, 1, 1, 2, 0),
+                (7, 0, 0, 2, 1),
+                (7, 1, 1, 2, 1),
+                (1, 0, 0, 1, 0),
+                (1, 1, 1, 1, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn algorithm1_score_first_timestamp_only_breaks_ties() {
+        use std::cmp::Ordering::Less;
+        let older_high_score = (9, Some(5), 10, 1);
+        let newer_low_score = (2, Some(10), 0, 2);
+        assert_eq!(
+            candidate_cmp(older_high_score, newer_low_score, true, false),
+            Less
+        );
+        assert_eq!(
+            candidate_cmp(newer_low_score, older_high_score, true, true),
+            Less
+        );
+        assert_eq!(
+            candidate_cmp((2, Some(10), 10, 2), (2, Some(5), 0, 1), true, false),
+            Less
+        );
+        assert_eq!(
+            candidate_cmp((2, Some(5), 0, 1), (2, Some(10), 10, 2), false, false),
+            Less
+        );
+        assert_eq!(
+            candidate_cmp((2, Some(5), 0, 1), (2, None, 0, 2), true, false),
+            Less
+        );
+    }
+
+    #[test]
+    fn algorithm1_every_seed_uses_target_cutoff_and_preserves_bfs_budget() {
+        let s = fixture();
+        let d = &s.datasets["fixture"];
+        let collect = |legacy, width, budget| {
+            s.bfs_collect_nodes(
+                d,
+                1,
+                0,
+                legacy,
+                &mut StdRng::seed_from_u64(42),
+                budget,
+                width,
+                &mut HashMap::new(),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .unwrap()
+        };
+        let aligned = collect(false, 10, 100);
+        let legacy = collect(true, 10, 100);
+        assert!(aligned.contains(&(2, 2))); // Same time as target, later than seed.
+        assert!(!legacy.contains(&(2, 2)));
+        assert!(aligned.contains(&(5, 2)) && aligned.contains(&(6, 2)));
+        assert!(aligned.iter().all(|&(n, _)| n != 3 && n != 7));
+        assert_eq!(aligned.iter().filter(|&&(n, _)| n == 5).count(), 1);
+        let narrow = collect(false, 1, 100);
+        assert_eq!(narrow.iter().filter(|&&(n, _)| n == 5 || n == 6).count(), 1);
+        // Preserve the existing exclusive local cell limit: the row bringing
+        // raw column count to >= local_ctx_size is not returned/marked visited.
+        assert!(collect(false, 10, 2).is_empty());
+        assert_eq!(collect(false, 10, 4), vec![(1, 0)]);
+        assert!(within_cutoff(Some(100), None)); // No target time means unbounded.
+    }
+
+    #[test]
+    fn traces_are_repeatable_target_first_masked_and_budget_bounded() {
+        let mut s = fixture();
+        let (a, va) = build(&s, 12, false);
+        let (b, vb) = build(&s, 12, false);
+        assert_eq!(a.visits, b.visits);
+        assert_eq!(a.candidates, b.candidates);
+        assert_eq!(a.cells, b.cells);
+        assert_eq!(
+            serde_json::to_value(&a.collections).unwrap(),
+            serde_json::to_value(&b.collections).unwrap()
+        );
+        assert_eq!(va.is_targets, vb.is_targets);
+        assert_eq!(a.candidates[0], 0);
+        assert_eq!(a.collections[0].seed, 0);
+        assert!(a.collections.iter().all(|c| c.cutoff == Some(10)));
+        assert_eq!(a.cells[0], (0, 0, 0, 0, 0));
+        assert!(va.is_targets[0]);
+        assert!(a.cells.len() <= 12);
+        let unique: HashSet<_> = a.cells.iter().map(|c| (c.0, c.1)).collect();
+        assert_eq!(unique.len(), a.cells.len());
+        assert!(a.cells.iter().all(|c| {
+            !(c.2 == 0
+                && c.0 != 0
+                && get_node(&s.datasets["fixture"], c.0)
+                    .timestamp
+                    .as_ref()
+                    .map(|t| i32::from(*t))
+                    == Some(10))
+        }));
+        // Width/local collection changes do not perturb Stage 1 scores/order.
+        s.bfs_widths = vec![10];
+        s.local_ctx_sizes = vec![12];
+        let (c, _) = build(&s, 12, false);
+        assert_eq!(a.visits, c.visits);
+        assert_eq!(a.candidates, c.candidates);
+        s.num_walks = 0;
+        s.local_ctx_sizes = vec![2]; // Force empty collections so fallback is used.
+        let (f, _) = build(&s, 12, false);
+        assert!(f.visits.is_empty());
+        assert_eq!(f.candidates, vec![0]);
+        assert!(!f.fallback_candidates.is_empty());
+        assert!(f.collections.iter().any(|c| c.seed != 0));
+    }
+
+    #[test]
+    fn aligned_reverse_order_is_canonical_across_null_and_equal_timestamp_ties() {
+        let mut s = fixture();
+        // Simulate cross-table/task insertion order from pre.rs's HashMap.
+        let mut adj = vec![vec![]; 8];
+        let d = &s.datasets["fixture"];
+        adj[4] = [6, 5, 2, 0, 0]
+            .iter()
+            .map(|&idx| Edge {
+                node_idx: idx,
+                table_name_idx: if idx < 4 { 0 } else { 1 },
+                table_type: if idx < 4 {
+                    TableType::Train
+                } else {
+                    TableType::Db
+                },
+                timestamp: if idx < 4 { Some(10) } else { None },
+            })
+            .collect();
+        let original: Vec<i32> = adj[4].iter().map(|e| e.node_idx).collect();
+        assert_eq!(original, vec![6, 5, 2, 0, 0]);
+        assert!(d.sql_neighbor_provider.is_none());
+        s.datasets.get_mut("fixture").unwrap().p2f_adj_mmap = Some(mmap(
+            &rkyv::to_bytes::<Error>(&Adj { adj: adj.clone() }).unwrap(),
+        ));
+        let d = &s.datasets["fixture"];
+        let (_, reverse) = ordered_stage2_edges(d, 4, 0, 0, Some(10)).unwrap();
+        let canonical: Vec<i32> = reverse.iter().map(|(idx, _)| idx).collect();
+        assert_eq!(canonical, vec![5, 6, 0, 0, 2]);
+        // The stored archive used by legacy sampling must not be rewritten.
+        assert_eq!(
+            get_p2f_edges(d, 4)
+                .iter()
+                .map(|e| i32::from(e.node_idx))
+                .collect::<Vec<_>>(),
+            original
+        );
+        let collect = |s: &Sampler| {
+            s.bfs_collect_nodes(
+                &s.datasets["fixture"],
+                0,
+                0,
+                false,
+                &mut StdRng::seed_from_u64(42),
+                100,
+                1,
+                &mut HashMap::new(),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .unwrap()
+        };
+        let bfs_rows = collect(&s);
+        install_provider(&mut s);
+        assert_eq!(collect(&s), bfs_rows); // Canonical SQL order is accepted.
+        // Permute both timestamp ties without changing time-sortedness. The
+        // installed provider and aligned BFS must still yield the same rows.
+        adj[4].swap(0, 1);
+        adj[4][2..].reverse();
+        s.datasets.get_mut("fixture").unwrap().p2f_adj_mmap =
+            Some(mmap(&rkyv::to_bytes::<Error>(&Adj { adj }).unwrap()));
+        assert_eq!(collect(&s), bfs_rows);
+        Python::with_gil(|py| s.set_sql_neighbor_provider_py(py, "fixture", None).unwrap());
+        assert_eq!(collect(&s), bfs_rows);
+    }
+
+    #[test]
+    fn sql_neighbor_mapping_consumes_owned_ids_and_preserves_duplicate_metadata() {
+        let s = fixture();
+        let reverse = get_p2f_edges(&s.datasets["fixture"], 4);
+        let metadata = vec![&reverse[1], &reverse[2], &reverse[3]];
+        let first_occurrence = metadata[0] as *const ArchivedEdge;
+        let second_occurrence = metadata[1] as *const ArchivedEdge;
+        let sql_ids = vec![5, 5, 6];
+        let sql_buffer = sql_ids.as_ptr();
+        let mapped = Stage2Edges::from_sql(sql_ids, metadata).unwrap();
+        // Reject implementations which validate SQL but rebuild graph IDs.
+        assert_eq!(mapped.node_idxs.as_ptr(), sql_buffer);
+        assert_eq!(
+            mapped.iter().map(|(idx, _)| idx).collect::<Vec<_>>(),
+            vec![5, 5, 6]
+        );
+        assert_ne!(first_occurrence, second_occurrence);
+        assert_eq!(mapped.metadata[0] as *const ArchivedEdge, first_occurrence);
+        assert_eq!(mapped.metadata[1] as *const ArchivedEdge, second_occurrence);
+    }
+
+    fn install_provider(s: &mut Sampler) -> PyObject {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let d = &s.datasets["fixture"];
+            let adjacency: HashMap<_, _> = (0..8)
+                .map(|n| {
+                    let (f, p) = ordered_stage2_edges(d, n, 0, 0, Some(10)).unwrap();
+                    let ids = |edges: Stage2Edges<'_>| edges.node_idxs;
+                    (n, (ids(f), ids(p)))
+                })
+                .collect();
+            let globals = PyDict::new(py);
+            globals.set_item("adjacency", adjacency).unwrap();
+            globals
+                .set_item("calls", Vec::<(i32, i32, i32, Option<i32>)>::new())
+                .unwrap();
+            py.run(pyo3::ffi::c_str!("def provider(node, target, seed, cutoff):\n    calls.append((node, target, seed, cutoff))\n    return adjacency[node]\n"), Some(&globals), None).unwrap();
+            let provider = globals.get_item("provider").unwrap().unwrap().unbind();
+            let calls = globals.get_item("calls").unwrap().unwrap().unbind();
+            s.set_sql_neighbor_provider_py(py, "fixture", Some(provider))
+                .unwrap();
+            calls
+        })
+    }
+
+    #[test]
+    fn sql_provider_preserves_stage1_bfs_rng_rows_and_final_cells() {
+        let mut s = fixture();
+        let (bfs, vb) = build(&s, 12, false);
+        let calls = install_provider(&mut s);
+        let (sql, vs) = build(&s, 12, false); // Caller has no GIL; callback reacquires it.
+        assert_eq!(bfs.visits, sql.visits);
+        assert_eq!(bfs.candidates, sql.candidates);
+        assert_eq!(bfs.cells, sql.cells);
+        assert_eq!(vb.node_idxs, vs.node_idxs);
+        assert_eq!(vb.is_targets, vs.is_targets);
+        assert_eq!(
+            serde_json::to_value(&bfs.collections).unwrap(),
+            serde_json::to_value(&sql.collections).unwrap()
+        );
+        Python::with_gil(|py| {
+            // Same dtype registration performed by rt.data before batch export.
+            py.import("ml_dtypes").unwrap();
+            let calls: Vec<(i32, i32, i32, Option<i32>)> = calls.bind(py).extract().unwrap();
+            assert_eq!(
+                calls.len(),
+                sql.collections.iter().map(|c| c.rows.len()).sum::<usize>()
+            );
+            assert!(calls.iter().all(|c| c.1 == 0 && c.3 == Some(10)));
+            // Exercise the Rayon/GIL boundary and the actual Python-callable API.
+            assert!(s.batch_for_nodes_py(py, vec![0, 0], 0, 12).is_ok());
+            let trace = s.trace_py(py, 0, 0, 12, 0, false).unwrap();
+            assert!(trace.bind(py).get_item("collections").is_ok());
+            assert_eq!(
+                trace
+                    .bind(py)
+                    .get_item("reverse_neighbor_order")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "timestamp_none_first_then_node_idx"
+            );
+            assert!(s.trace_py(py, 0, 0, 12, 0, true).is_err());
+            s.set_sql_neighbor_provider_py(py, "fixture", None).unwrap();
+            let legacy = s.trace_py(py, 0, 0, 12, 0, true).unwrap();
+            assert_eq!(
+                legacy
+                    .bind(py)
+                    .get_item("reverse_neighbor_order")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "stored"
+            );
+        });
+    }
+
+    #[test]
+    fn eager_raw_sql_experiment_remains_isolated_and_unchanged() {
+        let mut s = fixture();
+        let contexts = (0..4).map(|n| (n, vec![(n, 0), (4, 1), (5, 2)])).collect();
+        s.set_sql_contexts_py("fixture", contexts).unwrap();
+        let orders = (0..4)
+            .map(|n| (n, if n == 0 { vec![1] } else { vec![] }))
+            .collect();
+        s.set_sql_seed_order_py("fixture", orders).unwrap();
+        s.datasets.get_mut("fixture").unwrap().p2f_adj_mmap = None;
+        let (trace, _) = build(&s, 12, false);
+        assert!(trace.visits.is_empty());
+        assert_eq!(trace.candidates, vec![0, 1]);
+        assert!(trace.fallback_candidates.is_empty());
+        let seed = trace.collections.iter().find(|c| c.seed == 1).unwrap();
+        assert_eq!(seed.cutoff, Some(5)); // Eager/raw SQL retains its old policy.
+        assert!(!seed.rows.iter().any(|&(n, _)| n == 5));
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let globals = PyDict::new(py);
+            py.run(
+                pyo3::ffi::c_str!("def provider(*args):\n    return ([], [])\n"),
+                Some(&globals),
+                None,
+            )
+            .unwrap();
+            let provider = globals.get_item("provider").unwrap().unwrap().unbind();
+            assert!(
+                s.set_sql_neighbor_provider_py(py, "fixture", Some(provider))
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn sql_provider_rejects_bad_identity_order_cutoff_and_propagates_errors() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            assert!(validate_neighbor_order(&[2, 1], &[1, 2]).is_err());
+            assert!(validate_neighbor_order(&[1], &[1, 1]).is_err());
+            assert!(validate_neighbor_order(&[-1], &[1]).is_err());
+            assert!(validate_neighbor_order(&[1, 3], &[1]).is_err());
+            let mut s = fixture();
+            let globals = PyDict::new(py);
+            py.run(
+                pyo3::ffi::c_str!("def bad(*args):\n    return ([999999], [])\n"),
+                Some(&globals),
+                None,
+            )
+            .unwrap();
+            let bad = globals.get_item("bad").unwrap().unwrap().unbind();
+            s.set_sql_neighbor_provider_py(py, "fixture", Some(bad))
+                .unwrap();
+            assert!(s.trace_py(py, 0, 0, 12, 0, false).is_err());
+            assert!(s.batch_py(py, Some(0), 1, 12).is_err());
+            assert!(s.batch_py(py, None, 1, 12).is_err());
+            assert_eq!(s.step, 0); // Errors do not advance the sampling step.
+            py.run(
+                pyo3::ffi::c_str!(
+                    "def broken(*args):\n    raise RuntimeError('SQL query failed')\n"
+                ),
+                Some(&globals),
+                None,
+            )
+            .unwrap();
+            let broken = globals.get_item("broken").unwrap().unwrap().unbind();
+            s.set_sql_neighbor_provider_py(py, "fixture", Some(broken))
+                .unwrap();
+            let err = s.trace_py(py, 0, 0, 12, 0, false).unwrap_err();
+            assert!(err.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py));
+            assert!(err.to_string().contains("SQL query failed"));
+            assert!(s.set_sql_contexts_py("fixture", HashMap::new()).is_err());
+            let not_callable = 1i32.into_py_any(py).unwrap();
+            assert!(
+                s.set_sql_neighbor_provider_py(py, "fixture", Some(not_callable))
+                    .is_err()
+            );
+        });
+    }
+}
+
 pub fn main(cli: Cli) {
     let tic = Instant::now();
     let sampler = Sampler::new_impl(
@@ -2575,7 +3597,9 @@ pub fn main(cli: Cli) {
     for _ in 0..cli.num_trials {
         let tic = Instant::now();
         let batch_idx = rng.random_range(0..sampler.len(cli.bs));
-        let _vecs = sampler.batch(Some(batch_idx), 0, cli.bs, cli.seq_len);
+        let _vecs = sampler
+            .batch(Some(batch_idx), 0, cli.bs, cli.seq_len)
+            .expect("Sampler batch failed");
         let elapsed = tic.elapsed().as_millis();
         sum += elapsed;
         sum_sq += elapsed * elapsed;

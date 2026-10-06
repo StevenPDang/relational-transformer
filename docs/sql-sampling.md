@@ -151,7 +151,93 @@ evaluator setup. These measurements explain the raw prototype's cost. The
 Stage-2-only target should measure its own SQL calls after holding Stage 1
 fixed; optimizing raw SQL's historical seed ordering is outside that target.
 
-## Existing hybrid SQL path using prepared data
+## On-demand Stage 2 SQL collector
+
+Graph-backed `--sql-context-db` evaluation now uses `load_stage2_sql_provider`
+in `src/rt/sql_context.py`, installed through
+`Sampler.set_sql_neighbor_provider_py`. Graph-free raw SQL retains the earlier
+experiment and its historical-seed policy. No eager task-context map or SQL
+seed-order map is created for graph-backed evaluation.
+
+The aligned BFS baseline counts walk destinations after moving, ranks by visit
+score with optional recency tie-breaking, and applies the target's timestamp to
+all local seeds and both edge directions. Null cutoff means unbounded; null
+neighbors and equal timestamps are eligible. Reverse-edge ties are ordered by
+node index (null timestamps first). This fourth alignment is necessary because
+preprocessing previously inherited hash-map iteration order across tables.
+Forward keys retain source column/list order. These baseline changes affect
+ordinary BFS too; old benchmark numbers are not measurements of this baseline.
+
+`Sampler.trace_py(dataset_idx, node_idx, ctx_size, step=0, legacy=False)` returns
+visits, candidate order, fallback order, collector parameters/rows, final cell
+identities, and `sequence` as the usual list of `(name, value)` pairs. Set
+`legacy=True` before installing a provider to capture the pre-alignment policy;
+Rust tests retain a golden legacy trace.
+
+The SQL provider returns complete ordered forward/reverse neighbor IDs for one
+expanded node. Rust validates them against the encoded graph, then uses those
+SQL-returned IDs with graph metadata to retain its frontier, width RNG, shared
+visited depths, local/global budgets, deduplication, and masks. FK values are
+**parent row positions**, not arbitrary PK values. SQL uses parameterized
+cutoffs, row-position joins, and `UNION ALL` to preserve duplicate FK paths.
+
+Source tables must match the physical DuckDB rows and encoded counts/timestamps.
+Every graph table and task split must be available, including local task
+manifests. Each process/thread lazily opens a read-only connection with temporary
+normalized row tables and an edge view. Connections/locks are excluded from
+pickling; persistent database tables are not modified. The provider still copies
+source row/FK metadata per querying thread; it is not a graph-free sampler.
+
+### Validation and performance status
+
+`tests/test_sql_stage2.py` covers native BFS/SQL trace and batch parity, duplicate
+paths, multiple child tables and all task splits, equal/future timestamps,
+width-limited collection, budgets, deduplication, masks, thread/fresh-process
+pickle determinism, and rejection of source/neighbor mismatches. Rust has ten
+focused baseline/seam tests. Full DataLoader fork determinism and production
+revision parity remain unverified.
+
+A bounded Mac CPU spike on a 100-node synthetic graph (80 walks, length 6,
+64 global cells, 32 local cells, width 1, ten warm repeats) measured:
+
+| Collector | Cold item | Warm mean/item |
+| --- | ---: | ---: |
+| Aligned BFS | 0.152 ms | 0.070 ms |
+| On-demand Python/DuckDB prototype | 131.3 ms | 116.4 ms |
+
+The SQL measurements included 20 adjacency queries/item and graph validation.
+This route is **not accepted as a performance solution**. It provides a working
+correctness reference; plan step 4 still requires a batched/two-pass or native
+worker-local execution route. Do not interpret this tiny spike as rel-f1 timing.
+The cached rel-f1 source also lacks a required task manifest, so production
+source validation currently fails closed. No new CUDA timing or AUROC is claimed.
+
+### Running equal-input comparisons
+
+After building the extension, with complete matching source data:
+
+```bash
+pixi run --environment mac python -m pytest tests/test_sql_stage2.py tests/test_sql_context.py
+pixi run --environment mac python -m scripts.compare_sql_stage2 \
+  --pre-dir stanford-star/relbench-preprocessed \
+  --duckdb data/duckdb/rel-f1.duckdb --items 726 --repeats 3 \
+  --ctx-size 8192 --local-ctx-size 256 --width 32 \
+  --num-walks 10000 --walk-length 20 --context-seed 0 \
+  --output compare_sql_stage2.json
+```
+
+The checkpoint-independent harness records legacy/aligned/SQL traces, setup and
+per-item times, overlaps, label counts, query counts, temporal/mask/budget checks,
+and exact aligned BFS/SQL Stage 1 and encoded-sequence parity. Equal-time label
+counts are reported rather than rejected under the inclusive Algorithm 1 policy.
+Defaults cover all 726 test targets; no model or AUROC is involved.
+
+For model scoring on the same CUDA machine, run `scripts/eval.py` twice with the
+same checkpoint, prepared data, seed and context settings, changing only
+`--sql-context-db` and the output directory. Verify both score all 726 rows and
+repeat end-to-end timings. Keep the raw experiment above separate.
+
+## Archived eager hybrid SQL experiment
 
 The first experiment replaces local BFS expansion for `rel-f1/driver-top3`.
 Random walks and same-table seed selection remain in Rust. SQL supplies each
@@ -166,15 +252,19 @@ within small budgets. This is a small task-specific neighborhood, not an
 exact reproduction of the BFS sample. Raw values are retained rather than
 aggregated into features.
 
-Acceptance: an opt-in evaluation builds valid model batches using these SQL
-nodes, keeps the target first, respects temporal cutoffs and cell budgets, and
-fails on misaligned data. The default sampler remains unchanged.
+At that time, opt-in evaluation built batches from these SQL nodes, retained
+the target and budgets, and left the default sampler unchanged. This archived
+policy is no longer selected by graph-backed `--sql-context-db`.
 
 Implementation: `src/rt/sql_context.py` materializes neighborhoods once before
 DataLoader workers start; `rustler/src/fly.rs` consumes them instead of BFS.
 Tests live in `tests/test_sql_context.py`. Use `pixi run build-sampler` to build
 the extension and `pixi run python -m pytest tests/test_sql_context.py` to test.
 No persistent database tables or preprocessing artifacts are modified.
+
+The commands below now select the on-demand implementation described above;
+the following query-width, seed-cutoff, and materialization descriptions are
+historical details of the eager experiment, not the current flag's behavior.
 
 Build and inspect a small batch locally without a model or GPU:
 

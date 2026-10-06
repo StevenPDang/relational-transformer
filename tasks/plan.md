@@ -9,7 +9,33 @@ and model-input encoding. Use the user's Algorithm 1 as the final behavioral
 contract. The graph-free raw SQL experiment, which also replaces Stage 1, is
 separate evidence and is not the baseline for this work.
 
-## Where the code stands
+## Implementation progress (2026-10-05)
+
+Steps 1–3 have focused Rust/native Python verification. Graph-backed evaluation
+now has an opt-in on-demand SQL correctness path; the eager raw experiment is
+unchanged. `Sampler.trace_py(..., legacy=True)` preserves a pre-alignment trace,
+while the aligned baseline uses count-after-move, score-first ranking and target
+time. Aligned reverse edges also break timestamp ties by node index: preprocessing
+previously used stable timestamp sorting over hash-map insertion order, which SQL
+could not reproduce from source row offsets alone. Legacy tracing retains that
+stored order. This is a separately documented baseline policy change, not a SQL
+sampling-policy difference.
+
+The collector seam queries SQL once per expanded node, consumes its ordered IDs,
+and retains Rust frontier/RNG/visited-depth/cell logic. It validates SQL IDs and
+order against graph metadata. Source mapping is based on encoded row offsets and
+parent row-position FKs, with duplicate paths retained. No eager contexts or SQL
+seed-order maps are needed. Worker connections are lazy process/thread-local.
+
+Step 4's performance route remains open: the correctness spike measured about
+116.4 ms warm/item versus 0.070 ms BFS on a tiny synthetic graph, so this callback
+route is not performance-accepted. Full DataLoader/fork determinism, production
+source parity, and step 5's CUDA/726-row AUROC gates are pending. The available
+cached rel-f1 source lacks a required task manifest and fails validation.
+See `tasks/todo.md`, `docs/sql-sampling.md`, and
+`scripts/compare_sql_stage2.py` for checks and reproduction commands.
+
+## Original starting point
 
 | Algorithm 1 piece | Current implementation | Gap |
 | --- | --- | --- |
