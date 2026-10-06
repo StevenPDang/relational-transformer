@@ -33,6 +33,8 @@ def parse_args():
     parser.add_argument('--items', type=int, default=726,
                         help='fixed Test-table prefix, capped at split size (default: all 726)')
     parser.add_argument('--repeats', type=int, default=1)
+    parser.add_argument('--sql-route', choices=['batched', 'scalar'], default='batched',
+                        help='batched plan/replay (default) or original per-node SQL reference')
     parser.add_argument('--ctx-size', type=int, default=256)
     parser.add_argument('--local-ctx-size', type=int, default=128)
     parser.add_argument('--width', type=int, default=8)
@@ -215,6 +217,11 @@ def run(args, report):
             after = provider.stats
             timing['query_count'] = after['query_count'] - before['query_count']
             timing['query_seconds'] = after['total_seconds'] - before['total_seconds']
+            timing['connection_setup_count'] = after['setup_count'] - before['setup_count']
+            timing['connection_setup_seconds'] = after['setup_seconds'] - before['setup_seconds']
+            timing['requested_nodes'] = after['requested_nodes'] - before['requested_nodes']
+            timing['execution_route'] = trace['execution_route']
+            timing['execution_stats'] = trace['execution_stats']
         records[target]['timings'].setdefault(mode, []).append(timing)
         if repeat == 0:
             records[target]['traces'][mode] = trace
@@ -233,6 +240,7 @@ def run(args, report):
                 if mode == 'sql':
                     tick = time.perf_counter()
                     provider = load_stage2_sql_provider(pre_dir, args.duckdb)
+                    provider.batch_enabled = args.sql_route == 'batched'
                     sampler.set_sql_neighbor_provider_py('rel-f1', provider)
                     report['setup_seconds']['sql_provider_load_validate_install'] = time.perf_counter() - tick
                 phase_start = time.perf_counter()
@@ -287,7 +295,7 @@ def main():
               'model_inference': False, 'auroc_measured': False,
               'settings': {**vars(args), 'output': str(args.output)},
               'setup_seconds': {}, 'phase_seconds': {}, 'trace_seconds': {}, 'failures': [],
-              'timing_note': 'trace_py includes trace/NumPy construction; SQL query time includes lazy connection setup'}
+              'timing_note': 'trace_py includes trace/NumPy construction; SQL query time includes lazy connection/index setup, also reported separately; batched mode computes Stage 1 twice'}
     try:
         run(args, report)
     except Exception as exc:

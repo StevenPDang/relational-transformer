@@ -94,7 +94,12 @@ def test_sql_stage2_trace_batch_temporal_budget_and_mask_parity(stage2):
     assert provider.stats['query_count'] == 0
     sampler.set_sql_neighbor_provider_py('synth', provider)
     for target, expected in zip(targets, baseline):
+        before = provider.stats['query_count']
         actual = sampler.trace_py(0, target, 64)
+        assert provider.stats['query_count'] - before == 1
+        assert actual['execution_route'] == 'sql_neighbors_batch_plan_replay'
+        assert actual['execution_stats']['provider_calls'] == 1
+        assert actual['execution_stats']['stage1_passes'] == 2
         assert_trace_equal(expected, actual)
         assert_trace_equal(actual, sampler.trace_py(0, target, 64))
         assert actual['collector'] == 'sql_neighbors'
@@ -137,7 +142,109 @@ def test_sql_stage2_thread_and_spawn_worker_determinism(stage2):
         return pickle.loads(result.stdout)
     with ThreadPoolExecutor(max_workers=2) as pool:
         assert list(pool.map(in_process, range(2))) == [expected] * 2
+    # Batched retrieval follows the same pickle/worker boundary.
+    batched = restored.query_many([node, target], target, None)
+    assert batched[node] == expected
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(lambda _: restored.query_many([node, target], target, None),
+                             range(4))) == [batched] * 4
+    code = ('import duckdb,pandas; import sys,pickle; provider,args=pickle.loads(sys.stdin.buffer.read()); '
+            'sys.stdout.buffer.write(pickle.dumps(provider.query_many(*args)))')
+    args = ([node, target], target, None)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(in_process, range(2))) == [batched] * 2
     provider.close()
+
+
+def test_sql_batch_map_matches_scalar_reference_and_queries_only_requests(stage2):
+    ds, provider, info, _, _ = stage2
+    scalar = pickle.loads(pickle.dumps(provider))
+    scalar.batch_enabled = False
+    assert scalar.query_many is None
+    target = info['events:Db']['node_idx_offset'] + 17
+    nodes = [target, info['users:Db']['node_idx_offset']]
+    cutoff = 1704499200
+    expected = {node: scalar(node, target, target, cutoff) for node in nodes}
+    actual = provider.query_many(nodes + nodes, target, cutoff)
+    assert actual == expected
+    assert set(actual) == set(nodes)
+    assert provider.stats['query_count'] == 1
+    assert provider.stats['requested_nodes'] == len(nodes)
+    assert provider.stats['setup_count'] == 1
+    assert provider.query_many([], target, None) == {}
+    assert provider.stats['query_count'] == 1
+    with pytest.raises(ValueError, match='out of range'):
+        provider.query_many([2**30], target, None)
+    ds.sampler.set_sql_neighbor_provider_py('synth', scalar)
+    reference = ds.sampler.trace_py(0, target, 64)
+    assert reference['execution_route'] == 'sql_neighbors_scalar'
+    ds.sampler.set_sql_neighbor_provider_py('synth', provider)
+    assert_trace_equal(reference, ds.sampler.trace_py(0, target, 64))
+    scalar.close()
+    provider.close()
+
+
+def test_sql_providers_coexist_with_live_default_duckdb_connection(stage2):
+    _, provider, info, database, pre = stage2
+    target = info['events:Db']['node_idx_offset'] + 17
+    live = duckdb.connect(str(database), read_only=True)
+    second = None
+    try:
+        expected = provider.query_many([target], target, None)
+        # Validation and worker connections must use compatible DB configuration.
+        second = load_stage2_sql_provider(pre, database, 'synth')
+        assert second.query_many([target], target, None) == expected
+        assert live.execute('SELECT count(*) FROM events').fetchone()[0] == 18
+    finally:
+        if second is not None:
+            second.close()
+        provider.close()
+        live.close()
+
+
+def test_comparison_cli_reports_batched_route_and_setup(stage2, tmp_path):
+    import yaml
+    from pathlib import Path
+    from rt._rustler import preprocess
+
+    _, _, _, database, pre = stage2
+    source = Path(json.loads((pre / 'synth' / 'meta.json').read_text())['source'])
+    manifest_path = source / 'manifest.yaml'
+    manifest = yaml.safe_load(manifest_path.read_text())
+    manifest['name'] = 'rel-f1'
+    manifest_path.write_text(yaml.safe_dump(manifest))
+    task_dir = source / 'tasks' / 'driver-top3'
+    task_dir.mkdir()
+    spec = yaml.safe_load((source / 'tasks' / 'labels' / 'manifest.yaml').read_text())
+    spec['target_col'] = 'qualifying'
+    (task_dir / 'manifest.yaml').write_text(yaml.safe_dump(spec))
+    for split in ('train', 'val', 'test'):
+        frame = pd.read_parquet(source / 'tasks' / 'labels' / f'{split}.parquet')
+        frame.rename(columns={'label': 'qualifying'}).to_parquet(task_dir / f'{split}.parquet')
+    cli_pre = tmp_path / 'cli_pre'
+    preprocess(str(source), str(cli_pre), skip_tasks=False)
+    db_dir = cli_pre / 'rel-f1'
+    text = json.loads((db_dir / 'text.json').read_text())
+    np.zeros((len(text), 384), dtype=np.uint16).tofile(db_dir / 'text_emb_all-MiniLM-L12-v2.bin')
+    output = tmp_path / 'comparison.json'
+    result = subprocess.run([
+        sys.executable, '-m', 'scripts.compare_sql_stage2',
+        '--pre-dir', str(cli_pre), '--duckdb', str(database),
+        '--items', '2', '--repeats', '2', '--ctx-size', '64',
+        '--local-ctx-size', '32', '--width', '1', '--num-walks', '80',
+        '--walk-length', '6', '--sql-route', 'batched', '--output', str(output),
+    ], capture_output=True, timeout=60)
+    assert result.returncode == 0, result.stdout.decode() + result.stderr.decode()
+    report = json.loads(output.read_text())
+    assert report['passed'] and report['failures'] == []
+    assert report['query_stats']['query_count'] == 4
+    assert report['query_stats']['setup_count'] == 1
+    for item in report['items']:
+        assert item['aligned_vs_sql']['different_fields'] == []
+        for timing in item['timings']['sql']:
+            assert timing['query_count'] == 1
+            assert timing['execution_stats']['provider_calls'] == 1
+            assert timing['execution_stats']['stage1_passes'] == 2
 
 
 def test_sql_stage2_rejects_source_revision_and_bad_neighbors(stage2):

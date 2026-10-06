@@ -76,10 +76,35 @@ enum BuildError {
     SqlProvider(pyo3::PyErr),
 }
 
+type SqlAdjacency = HashMap<i32, (Vec<i32>, Vec<i32>)>;
+
+/// Per-item state is explicitly threaded through traversal: planning never calls
+/// Python, and replay cannot fall back to scalar queries or another item's map.
+enum Stage2Collector<'a> {
+    Normal {
+        queries: usize,
+    },
+    Planning {
+        requests: Vec<i32>,
+        seen: HashSet<i32>,
+    },
+    Replay(&'a SqlAdjacency),
+}
+
+impl Default for Stage2Collector<'_> {
+    fn default() -> Self {
+        Self::Normal { queries: 0 }
+    }
+}
+
 /// Trace-only legacy policy preserves the pre-alignment baseline for comparison.
 #[derive(Default)]
 struct BuildTrace {
     legacy: bool,
+    execution_route: &'static str,
+    provider_calls: usize,
+    requested_nodes: usize,
+    stage1_passes: usize,
     step_seed: u64,
     local_ctx_size: usize,
     bfs_width: usize,
@@ -657,6 +682,9 @@ impl Sampler {
     /// Duplicate edges must be preserved. Forward order follows the encoded
     /// column/list order; reverse order is (timestamp None first, node_idx).
     /// Rust verifies identity/order, then consumes SQL IDs with graph metadata.
+    /// A callable query_many(node_idxs, target_node_idx, target_timestamp) method
+    /// opts into one item-local batch query after deterministic graph planning.
+    /// Omit it (or wrap the scalar callable) to retain the scalar reference path.
     #[pyo3(signature = (db_name, provider))]
     fn set_sql_neighbor_provider_py(
         &mut self,
@@ -790,6 +818,12 @@ impl Sampler {
                 "bfs"
             },
         )?;
+        out.set_item("execution_route", trace.execution_route)?;
+        let stats = PyDict::new(py);
+        stats.set_item("provider_calls", trace.provider_calls)?;
+        stats.set_item("requested_nodes", trace.requested_nodes)?;
+        stats.set_item("stage1_passes", trace.stage1_passes)?;
+        out.set_item("execution_stats", stats)?;
         out.set_item("visits", trace.visits)?;
         out.set_item("candidate_order", trace.candidates)?;
         out.set_item("fallback_candidates", trace.fallback_candidates)?;
@@ -1460,6 +1494,114 @@ impl Sampler {
         deadline: Instant,
         mut trace: Option<&mut BuildTrace>,
     ) -> Result<(), BuildError> {
+        check_deadline(deadline);
+        let dataset = &self.datasets[&self.dataset_tuples[item.dataset_idx as usize].0];
+        let legacy = trace.as_ref().is_some_and(|t| t.legacy);
+        let query_many = if legacy {
+            None
+        } else if let Some(provider) = &dataset.sql_neighbor_provider {
+            Python::with_gil(|py| -> PyResult<Option<PyObject>> {
+                match provider.bind(py).getattr("query_many") {
+                    Ok(method) => Ok(method.is_callable().then(|| method.unbind())),
+                    Err(err) if err.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => {
+                        Ok(None)
+                    }
+                    Err(err) => Err(err),
+                }
+            })
+            .map_err(BuildError::SqlProvider)?
+        } else {
+            None
+        };
+        if let Some(query_many) = query_many {
+            let mut collector = Stage2Collector::Planning {
+                requests: Vec::new(),
+                seen: HashSet::new(),
+            };
+            // Planning stops before tensor emission and collects no trace.
+            // Stage 1 and all RNG streams/settings are recomputed unchanged.
+            self.seq_build_pass(item, slices, step, ctx_len, deadline, None, &mut collector)?;
+            let Stage2Collector::Planning { requests, .. } = collector else {
+                unreachable!()
+            };
+            check_deadline(deadline);
+            let cutoff = get_node(dataset, item.node_idx)
+                .timestamp
+                .as_ref()
+                .map(|t| i32::from(*t));
+            let adjacency: SqlAdjacency = Python::with_gil(|py| {
+                query_many
+                    .bind(py)
+                    .call1((&requests, item.node_idx, cutoff))?
+                    .extract()
+            })
+            .map_err(BuildError::SqlProvider)?;
+            check_deadline(deadline);
+            if requests.iter().any(|n| !adjacency.contains_key(n)) {
+                return Err(BuildError::SqlProvider(
+                    pyo3::exceptions::PyValueError::new_err(
+                        "SQL query_many missing requested node",
+                    ),
+                ));
+            }
+            if let Some(t) = trace.as_deref_mut() {
+                t.execution_route = "sql_neighbors_batch_plan_replay";
+                t.provider_calls = 1;
+                t.requested_nodes = requests.len();
+                t.stage1_passes = 2;
+            }
+            self.seq_build_pass(
+                item,
+                slices,
+                step,
+                ctx_len,
+                deadline,
+                trace,
+                &mut Stage2Collector::Replay(&adjacency),
+            )
+        } else {
+            let mut collector = Stage2Collector::default();
+            if let Some(t) = trace.as_deref_mut() {
+                t.execution_route = if legacy {
+                    "legacy"
+                } else if dataset.sql_neighbor_provider.is_some() {
+                    "sql_neighbors_scalar"
+                } else if dataset.sql_seed_order.is_some() {
+                    "raw_sql"
+                } else if dataset.sql_contexts.is_some() {
+                    "eager_sql"
+                } else {
+                    "bfs"
+                };
+                t.stage1_passes = 1;
+            }
+            self.seq_build_pass(
+                item,
+                slices,
+                step,
+                ctx_len,
+                deadline,
+                trace.as_deref_mut(),
+                &mut collector,
+            )?;
+            if let (Some(t), Stage2Collector::Normal { queries }) = (trace, collector) {
+                t.provider_calls = queries;
+            }
+            Ok(())
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn seq_build_pass(
+        &self,
+        item: &Item,
+        slices: &mut Slices,
+        step: u64,
+        ctx_len: usize,
+        deadline: Instant,
+        mut trace: Option<&mut BuildTrace>,
+        collector: &mut Stage2Collector<'_>,
+    ) -> Result<(), BuildError> {
         let legacy = trace.as_ref().is_some_and(|t| t.legacy);
         check_deadline(deadline);
         let db_name = &self.dataset_tuples[item.dataset_idx as usize].0;
@@ -1678,6 +1820,7 @@ impl Sampler {
                 deadline,
                 legacy,
                 &mut trace,
+                collector,
             )? {
                 break 'fill_ctx;
             }
@@ -1742,6 +1885,7 @@ impl Sampler {
                                     deadline,
                                     legacy,
                                     &mut trace,
+                                    collector,
                                 )? {
                                     break 'fill_ctx;
                                 }
@@ -1787,6 +1931,7 @@ impl Sampler {
                                 deadline,
                                 legacy,
                                 &mut trace,
+                                collector,
                             )? {
                                 break 'fill_ctx;
                             }
@@ -1834,6 +1979,7 @@ impl Sampler {
                         deadline,
                         legacy,
                         &mut trace,
+                        collector,
                     )? {
                         break 'fill_ctx;
                     }
@@ -1862,6 +2008,7 @@ impl Sampler {
                         deadline,
                         legacy,
                         &mut trace,
+                        collector,
                     )? {
                         break 'fill_ctx;
                     }
@@ -1960,6 +2107,7 @@ impl Sampler {
                         deadline,
                         legacy,
                         &mut trace,
+                        collector,
                     )? {
                         break 'fill_ctx;
                     }
@@ -2004,6 +2152,7 @@ impl Sampler {
                         deadline,
                         legacy,
                         &mut trace,
+                        collector,
                     )? {
                         break 'fill_ctx;
                     }
@@ -2011,6 +2160,10 @@ impl Sampler {
             }
         }
 
+        if matches!(collector, Stage2Collector::Planning { .. }) {
+            check_deadline(deadline);
+            return Ok(());
+        }
         if let Some(t) = trace.as_deref_mut() {
             t.cells = cells_to_add.clone();
         }
@@ -2264,6 +2417,7 @@ impl Sampler {
         bfs_width: usize,
         visited_at_depth: &mut HashMap<i32, usize>,
         deadline: Instant,
+        collector: &mut Stage2Collector<'_>,
     ) -> Result<Vec<(i32, usize)>, BuildError> {
         if let Some(contexts) = &dataset.sql_contexts {
             let nodes = contexts.get(&start_idx).expect("SQL context missing seed");
@@ -2362,7 +2516,7 @@ impl Sampler {
                     Stage2Edges::from_graph(p2f.as_slice()[..valid].iter().collect()),
                 )
             } else {
-                ordered_stage2_edges(dataset, node_idx, target_idx, start_idx, cutoff)?
+                ordered_stage2_edges(dataset, node_idx, target_idx, start_idx, cutoff, collector)?
             };
 
             // Add f2p edges to f2p frontier
@@ -2470,6 +2624,7 @@ fn ordered_stage2_edges<'a>(
     target_idx: i32,
     seed_idx: i32,
     cutoff: Option<i32>,
+    collector: &mut Stage2Collector<'_>,
 ) -> Result<(Stage2Edges<'a>, Stage2Edges<'a>), BuildError> {
     let eligible = |edge: &&ArchivedEdge| {
         let neighbor_idx: i32 = edge.node_idx.into();
@@ -2502,7 +2657,26 @@ fn ordered_stage2_edges<'a>(
             i32::from(edge.node_idx),
         )
     });
-    if let Some(provider) = &dataset.sql_neighbor_provider {
+    if let Stage2Collector::Planning { requests, seen } = collector {
+        if seen.insert(node_idx) {
+            requests.push(node_idx);
+        }
+    } else if let Stage2Collector::Replay(adjacency) = collector {
+        let (actual_f2p, actual_p2f) = adjacency.get(&node_idx).ok_or_else(|| {
+            BuildError::SqlProvider(pyo3::exceptions::PyValueError::new_err(
+                "SQL query_many missing replay node",
+            ))
+        })?;
+        // Nodes can be expanded again at a shallower depth under another seed.
+        // Each occurrence consumes owned SQL IDs without removing the shared entry.
+        return Ok((
+            Stage2Edges::from_sql(actual_f2p.clone(), f2p).map_err(BuildError::SqlProvider)?,
+            Stage2Edges::from_sql(actual_p2f.clone(), p2f).map_err(BuildError::SqlProvider)?,
+        ));
+    } else if let Some(provider) = &dataset.sql_neighbor_provider {
+        if let Stage2Collector::Normal { queries } = collector {
+            *queries += 1;
+        }
         let (actual_f2p, actual_p2f) = Python::with_gil(|py| -> PyResult<(Vec<i32>, Vec<i32>)> {
             let (actual_f2p, actual_p2f): (Vec<i32>, Vec<i32>) = provider
                 .bind(py)
@@ -2546,6 +2720,7 @@ fn extend_with_seed_bfs(
     deadline: Instant,
     legacy: bool,
     trace: &mut Option<&mut BuildTrace>,
+    collector: &mut Stage2Collector<'_>,
 ) -> Result<bool, BuildError> {
     if cells_to_add.len() >= ctx_len {
         return Ok(true);
@@ -2562,6 +2737,7 @@ fn extend_with_seed_bfs(
         bfs_width,
         visited_at_depth,
         deadline,
+        collector,
     )?;
     if let Some(t) = trace.as_deref_mut() {
         let cutoff_node = get_node(
@@ -3249,6 +3425,7 @@ mod tests {
                 width,
                 &mut HashMap::new(),
                 Instant::now() + Duration::from_secs(10),
+                &mut Stage2Collector::default(),
             )
             .unwrap()
         };
@@ -3339,7 +3516,8 @@ mod tests {
             &rkyv::to_bytes::<Error>(&Adj { adj: adj.clone() }).unwrap(),
         ));
         let d = &s.datasets["fixture"];
-        let (_, reverse) = ordered_stage2_edges(d, 4, 0, 0, Some(10)).unwrap();
+        let (_, reverse) =
+            ordered_stage2_edges(d, 4, 0, 0, Some(10), &mut Stage2Collector::default()).unwrap();
         let canonical: Vec<i32> = reverse.iter().map(|(idx, _)| idx).collect();
         assert_eq!(canonical, vec![5, 6, 0, 0, 2]);
         // The stored archive used by legacy sampling must not be rewritten.
@@ -3361,6 +3539,7 @@ mod tests {
                 1,
                 &mut HashMap::new(),
                 Instant::now() + Duration::from_secs(10),
+                &mut Stage2Collector::default(),
             )
             .unwrap()
         };
@@ -3405,7 +3584,9 @@ mod tests {
             let d = &s.datasets["fixture"];
             let adjacency: HashMap<_, _> = (0..8)
                 .map(|n| {
-                    let (f, p) = ordered_stage2_edges(d, n, 0, 0, Some(10)).unwrap();
+                    let (f, p) =
+                        ordered_stage2_edges(d, n, 0, 0, Some(10), &mut Stage2Collector::default())
+                            .unwrap();
                     let ids = |edges: Stage2Edges<'_>| edges.node_idxs;
                     (n, (ids(f), ids(p)))
                 })
@@ -3473,6 +3654,202 @@ mod tests {
                     .unwrap(),
                 "stored"
             );
+        });
+    }
+
+    fn enable_batch_provider(s: &Sampler, py: Python<'_>) -> PyObject {
+        let provider = s.datasets["fixture"]
+            .sql_neighbor_provider
+            .as_ref()
+            .unwrap()
+            .bind(py);
+        let globals = provider
+            .getattr("__globals__")
+            .unwrap()
+            .downcast_into::<PyDict>()
+            .unwrap();
+        py.run(pyo3::ffi::c_str!("batch_calls = []\ndef query_many(nodes, target, cutoff):\n    batch_calls.append((nodes, target, cutoff))\n    return {n: adjacency[n] for n in nodes}\nprovider.query_many = query_many\n"), Some(&globals), None).unwrap();
+        globals.get_item("batch_calls").unwrap().unwrap().unbind()
+    }
+
+    #[test]
+    fn sql_batch_queries_once_per_item_and_replays_scalar_and_graph_exactly() {
+        let mut s = fixture();
+        s.mask_prob_max = 0.7;
+        let (graph, vg) = build(&s, 12, false);
+        let scalar_calls = install_provider(&mut s);
+        let (scalar, _) = build(&s, 12, false);
+        let expected_requests = Python::with_gil(|py| {
+            let calls: Vec<(i32, i32, i32, Option<i32>)> = scalar_calls.bind(py).extract().unwrap();
+            let mut seen = HashSet::new();
+            let requests: Vec<_> = calls
+                .into_iter()
+                .filter_map(|c| seen.insert(c.0).then_some(c.0))
+                .collect();
+            scalar_calls.bind(py).call_method0("clear").unwrap();
+            requests
+        });
+        let batch_calls = Python::with_gil(|py| enable_batch_provider(&s, py));
+        let (batch, vb) = build(&s, 12, false);
+        assert_eq!(graph.visits, batch.visits);
+        assert_eq!(graph.candidates, batch.candidates);
+        assert_eq!(graph.fallback_candidates, batch.fallback_candidates);
+        assert_eq!(scalar.cells, batch.cells);
+        assert_eq!(
+            serde_json::to_value(&scalar.collections).unwrap(),
+            serde_json::to_value(&batch.collections).unwrap()
+        );
+        macro_rules! same_sequence {
+            ($($field:ident),+ $(,)?) => { $(assert_eq!(vg.$field, vb.$field, stringify!($field));)+ };
+        }
+        same_sequence!(
+            node_idxs,
+            f2p_nbr_idxs,
+            table_name_idxs,
+            col_name_idxs,
+            class_value_idxs,
+            col_name_values,
+            sem_types,
+            number_values,
+            text_values,
+            datetime_values,
+            boolean_values,
+            is_targets,
+            is_task_nodes,
+            is_padding,
+            timestamps,
+            seed_node_idxs,
+            bfs_depths,
+            batch_mask,
+            seq_len
+        );
+        assert_eq!(batch.execution_route, "sql_neighbors_batch_plan_replay");
+        assert_eq!(batch.stage1_passes, 2);
+        assert_eq!(batch.provider_calls, 1);
+        assert_eq!(batch.requested_nodes, expected_requests.len());
+        assert_eq!(scalar.execution_route, "sql_neighbors_scalar");
+        assert_eq!(scalar.stage1_passes, 1);
+        Python::with_gil(|py| {
+            assert_eq!(scalar_calls.bind(py).len().unwrap(), 0);
+            let calls: Vec<(Vec<i32>, i32, Option<i32>)> = batch_calls.bind(py).extract().unwrap();
+            assert_eq!(calls, vec![(expected_requests, 0, Some(10))]);
+            py.import("ml_dtypes").unwrap();
+            batch_calls.bind(py).call_method0("clear").unwrap();
+            assert!(s.batch_for_nodes_py(py, vec![0, 0], 0, 12).is_ok());
+            assert_eq!(batch_calls.bind(py).len().unwrap(), 2);
+            batch_calls.bind(py).call_method0("clear").unwrap();
+            let traced = s.trace_py(py, 0, 0, 12, 0, false).unwrap();
+            assert_eq!(batch_calls.bind(py).len().unwrap(), 1);
+            assert_eq!(
+                traced
+                    .bind(py)
+                    .get_item("collector")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "sql_neighbors"
+            );
+        });
+    }
+
+    #[test]
+    fn sql_batch_missing_invalid_and_query_errors_propagate_without_scalar_fallback() {
+        let mut s = fixture();
+        let scalar_calls = install_provider(&mut s);
+        Python::with_gil(|py| {
+            enable_batch_provider(&s, py);
+            let provider = s.datasets["fixture"]
+                .sql_neighbor_provider
+                .as_ref()
+                .unwrap()
+                .bind(py)
+                .clone();
+            let globals = provider
+                .getattr("__globals__")
+                .unwrap()
+                .downcast_into::<PyDict>()
+                .unwrap();
+            py.run(pyo3::ffi::c_str!("def missing(nodes, target, cutoff):\n    return {}\ndef invalid(nodes, target, cutoff):\n    return {n: ([999999], []) for n in nodes}\ndef malformed(nodes, target, cutoff):\n    return {n: None for n in nodes}\ndef broken(nodes, target, cutoff):\n    raise RuntimeError('batch query failed')\n"), Some(&globals), None).unwrap();
+            for (name, message) in [
+                ("missing", "missing requested node"),
+                ("invalid", "identity/order/target cutoff"),
+                ("malformed", "NoneType"),
+                ("broken", "batch query failed"),
+            ] {
+                provider
+                    .setattr("query_many", globals.get_item(name).unwrap().unwrap())
+                    .unwrap();
+                let err = s.trace_py(py, 0, 0, 12, 0, false).unwrap_err();
+                assert!(err.to_string().contains(message), "{err}");
+                assert!(s.batch_py(py, Some(0), 1, 12).is_err());
+                assert!(s.batch_py(py, None, 1, 12).is_err());
+                assert_eq!(s.step, 0);
+                assert_eq!(scalar_calls.bind(py).len().unwrap(), 0);
+            }
+            // Failure must not leak replay state into a later successful item.
+            provider
+                .setattr(
+                    "query_many",
+                    globals.get_item("query_many").unwrap().unwrap(),
+                )
+                .unwrap();
+            assert!(s.trace_py(py, 0, 0, 12, 0, false).is_ok());
+            // A non-callable capability retains the explicit scalar reference.
+            provider.setattr("query_many", py.None()).unwrap();
+            let traced = s.trace_py(py, 0, 0, 12, 0, false).unwrap();
+            assert_eq!(
+                traced
+                    .bind(py)
+                    .get_item("execution_route")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "sql_neighbors_scalar"
+            );
+            assert!(scalar_calls.bind(py).len().unwrap() > 0);
+        });
+    }
+
+    #[test]
+    fn sql_batch_queries_only_planned_expansions_even_for_empty_plan() {
+        let mut s = fixture();
+        let scalar_calls = install_provider(&mut s);
+        let batch_calls = Python::with_gil(|py| enable_batch_provider(&s, py));
+        // Target cell fills the sequence: no unused seeds/adjacency requested.
+        s.local_ctx_sizes = vec![1];
+        let (_, v) = build(&s, 1, false);
+        assert_eq!(v.node_idxs, vec![0]);
+        Python::with_gil(|py| {
+            let calls: Vec<(Vec<i32>, i32, Option<i32>)> = batch_calls.bind(py).extract().unwrap();
+            assert_eq!(calls, vec![(vec![], 0, Some(10))]);
+            assert_eq!(scalar_calls.bind(py).len().unwrap(), 0);
+        });
+    }
+
+    #[test]
+    fn sql_batch_deadline_spans_planning_query_and_replay() {
+        let mut s = fixture();
+        install_provider(&mut s);
+        Python::with_gil(|py| {
+            let batch_calls = enable_batch_provider(&s, py);
+            s.timeout_per_item = 0.0;
+            assert!(s.trace_py(py, 0, 0, 12, 0, false).is_err());
+            assert_eq!(batch_calls.bind(py).len().unwrap(), 0);
+            s.timeout_per_item = 0.1;
+            let provider = s.datasets["fixture"]
+                .sql_neighbor_provider
+                .as_ref()
+                .unwrap()
+                .bind(py);
+            let globals = provider
+                .getattr("__globals__")
+                .unwrap()
+                .downcast_into::<PyDict>()
+                .unwrap();
+            // Return a valid result only after the original item deadline.
+            py.run(pyo3::ffi::c_str!("import time\ndef slow(nodes, target, cutoff):\n    time.sleep(0.2)\n    return {n: adjacency[n] for n in nodes}\nprovider.query_many = slow\n"), Some(&globals), None).unwrap();
+            let err = s.trace_py(py, 0, 0, 12, 0, false).unwrap_err();
+            assert!(err.to_string().contains("timed out"));
         });
     }
 

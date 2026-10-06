@@ -64,12 +64,12 @@ def main() -> None:
     ap.add_argument("--local-ctx-size", type=int, default=256)
     ap.add_argument("--bfs-width", type=int, default=32)
     ap.add_argument("--sql-context-db", default=None,
-                    help="opt-in rel-f1/driver-top3 SQL neighborhoods from this DuckDB file; "
-                         "--bfs-width bounds each DB history and historical label rows per seed")
+                    help="opt-in rel-f1/driver-top3 SQL Stage 2 collection from this DuckDB file; "
+                         "graph-backed data uses batched plan/replay with Rust width sampling")
     ap.add_argument("--num-walks", type=int, default=10_000)
     ap.add_argument("--walk-length", type=int, default=20)
     ap.add_argument("--prefer-latest", action=argparse.BooleanOptionalAction, default=True,
-                    help="rank same-table neighbors by recency (latest first) vs by frequency")
+                    help="break equal-frequency same-table candidate ties by recency")
     ap.add_argument("--shuffle-seed", type=int, default=0,
                     help="seed for val/test subset selection + item shuffle; fix it to keep an "
                          "--items-per-task subsample the same rows across configs")

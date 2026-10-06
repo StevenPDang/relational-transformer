@@ -129,12 +129,16 @@ class SqlNeighborProvider:
     There is no width limit, deduplication, historical seed order, or context
     cache. Forward order is source column/list order. Reverse order is nullable
     timestamp ascending (null first), then node index. Duplicate paths remain
-        in column/list order, matching the aligned Rust collector.
+    in column/list order, matching the aligned Rust collector.
 
     Construct with :meth:`from_frames` for synthetic data, or use
     :func:`load_stage2_sql_provider` for validated preprocessed graphs. Each
     worker thread lazily opens its own read-only DuckDB connection and creates
-    temporary normalized row tables and an edge *view*, not an edge table.
+    temporary normalized row tables and an indexed edge table. This adjacency
+    index amortizes FK joins; it is not an eager context or seed-order map.
+    With batch_enabled=True (default), query_many retrieves one item's actual
+    requests in one statement after Rust graph planning. Set batch_enabled=False
+    before first use to expose only the original scalar/edge-view reference route.
     Pickling excludes connections, thread-local storage, and locks; a PID
     change resets runtime state before accessing any inherited connection/lock.
     ``stats`` is a thread-safe snapshot of adjacency query_count/total_seconds
@@ -142,12 +146,14 @@ class SqlNeighborProvider:
     Counts and elapsed time are process-local and reset on pickle/fork.
     """
 
-    def __init__(self, database, rows, edge_sql, num_nodes, collect_stats=True):
+    def __init__(self, database, rows, edge_sql, num_nodes, collect_stats=True,
+                 batch_enabled=True):
         self.database = str(Path(database).expanduser().resolve())
         self._rows = rows
         self._edge_sql = edge_sql
         self._num_nodes = num_nodes
         self.collect_stats = collect_stats
+        self.batch_enabled = batch_enabled
         self._reset_runtime()
 
     @classmethod
@@ -278,6 +284,9 @@ class SqlNeighborProvider:
         self._stats_lock = threading.Lock()
         self._query_count = 0
         self._total_seconds = 0.0
+        self._setup_count = 0
+        self._setup_seconds = 0.0
+        self._requested_nodes = 0
 
     def _check_process(self):
         if self._pid != os.getpid():
@@ -285,7 +294,8 @@ class SqlNeighborProvider:
 
     def __getstate__(self):
         return {key: value for key, value in self.__dict__.items()
-                if key not in {"_pid", "_local", "_stats_lock", "_query_count", "_total_seconds"}}
+                if key not in {"_pid", "_local", "_stats_lock", "_query_count", "_total_seconds",
+                                               "_setup_count", "_setup_seconds", "_requested_nodes"}}
 
     def __setstate__(self, state):
         self.__dict__.update(state)
@@ -295,7 +305,9 @@ class SqlNeighborProvider:
     def stats(self):
         self._check_process()
         with self._stats_lock:
-            return {"query_count": self._query_count, "total_seconds": self._total_seconds}
+            return {"query_count": self._query_count, "total_seconds": self._total_seconds,
+                    "setup_count": self._setup_count, "setup_seconds": self._setup_seconds,
+                    "requested_nodes": self._requested_nodes}
 
     def close(self):
         """Close only this process/thread's connection; other workers own theirs."""
@@ -311,24 +323,83 @@ class SqlNeighborProvider:
         if con is None:
             import duckdb
 
+            start = time.perf_counter()
             con = duckdb.connect(self.database, read_only=True)
             try:
                 for alias, frame in self._rows.values():
                     con.register("_rt_input", frame)
                     con.execute(f"CREATE TEMP TABLE {_sql_identifier(alias)} AS SELECT * FROM _rt_input")
                     con.unregister("_rt_input")
-                con.execute(f"CREATE TEMP VIEW _rt_edges AS {self._edge_sql}")
+                # Normalize FK edges once per worker connection, not once per
+                # expanded node. This is an adjacency index, not a context map.
+                kind = "TABLE" if self.batch_enabled else "VIEW"
+                con.execute(f"CREATE TEMP {kind} _rt_edges AS {self._edge_sql}")
+                if self.batch_enabled:
+                    con.execute("CREATE INDEX _rt_child_idx ON _rt_edges(child)")
+                    con.execute("CREATE INDEX _rt_parent_idx ON _rt_edges(parent)")
             except BaseException:
                 con.close()
                 raise
             self._local.connection = con
+            if self.collect_stats:
+                with self._stats_lock:
+                    self._setup_count += 1
+                    self._setup_seconds += time.perf_counter() - start
         return con
 
-    def __call__(self, node_idx: int, target_node_idx: int, seed_node_idx: int,
-                 target_timestamp: int | None) -> tuple[list[int], list[int]]:
+    @property
+    def query_many(self):
+        """Capability detected by Rust; None preserves the scalar reference route.
+
+        Choose batch_enabled before opening any connection. The batched route
+        plans requests using the graph, then replays using one SQL result map.
+        """
+        return self._query_many if self.batch_enabled else None
+
+    def _query_many(self, node_idxs, target_node_idx, target_timestamp):
+        """Retrieve complete adjacency for requested nodes in one SQL statement.
+
+        The map always contains empty lists for isolated requested nodes. Only
+        Rust's actual item requests are returned; no seed/context cache survives
+        the item. Ordering, duplicates and temporal semantics match __call__.
+        """
+        self._validate_request(node_idxs, target_node_idx, target_timestamp)
+        nodes = list(dict.fromkeys(int(node) for node in node_idxs))
+        result = {node: ([], []) for node in nodes}
+        if not nodes:
+            return result
+        cutoff = None if target_timestamp is None else int(target_timestamp)
+        self._check_process()
+        start = time.perf_counter()
+        try:
+            con = self._connection()
+            found = con.execute("""
+                WITH requested AS (SELECT unnest(?::INTEGER[]) node_idx)
+                SELECT requested_node, direction, neighbor FROM (
+                    SELECT r.node_idx requested_node, 0 direction, e.parent neighbor,
+                           NULL::INTEGER edge_time, e.table_rank, e.column_rank,
+                           e.child, e.list_rank
+                    FROM _rt_edges e JOIN requested r ON e.child = r.node_idx
+                    WHERE (? IS NULL OR e.parent_time IS NULL OR e.parent_time <= ?)
+                    UNION ALL
+                    SELECT r.node_idx requested_node, 1 direction, e.child neighbor,
+                           e.child_time edge_time, e.table_rank, e.column_rank,
+                           e.child, e.list_rank
+                    FROM _rt_edges e JOIN requested r ON e.parent = r.node_idx
+                    WHERE (? IS NULL OR e.child_time IS NULL OR e.child_time <= ?)
+                ) ORDER BY requested_node, direction, edge_time ASC NULLS FIRST,
+                           child, table_rank, column_rank, list_rank
+            """, [nodes, cutoff, cutoff, cutoff, cutoff]).fetchall()
+            for node, direction, neighbor in found:
+                result[int(node)][int(direction)].append(int(neighbor))
+            return result
+        finally:
+            self._record_query(start, len(nodes))
+
+    def _validate_request(self, nodes, target_node_idx, target_timestamp):
         import numbers
 
-        for value in (node_idx, target_node_idx, seed_node_idx):
+        for value in (target_node_idx, *nodes):
             if not isinstance(value, numbers.Integral) or not 0 <= value < self._num_nodes:
                 raise ValueError(f"Node index out of range: {value!r}")
         if target_timestamp is not None and (
@@ -336,6 +407,18 @@ class SqlNeighborProvider:
             or not -(2**31) <= target_timestamp < 2**31
         ):
             raise ValueError("target_timestamp must be i32 epoch seconds or None")
+
+    def _record_query(self, start, requested_nodes):
+        if self.collect_stats:
+            elapsed = time.perf_counter() - start
+            with self._stats_lock:
+                self._query_count += 1
+                self._total_seconds += elapsed
+                self._requested_nodes += requested_nodes
+
+    def __call__(self, node_idx: int, target_node_idx: int, seed_node_idx: int,
+                 target_timestamp: int | None) -> tuple[list[int], list[int]]:
+        self._validate_request([node_idx, seed_node_idx], target_node_idx, target_timestamp)
         cutoff = None if target_timestamp is None else int(target_timestamp)
         self._check_process()
         start = time.perf_counter()
@@ -362,11 +445,7 @@ class SqlNeighborProvider:
                 (forward if direction == 0 else reverse).append(int(neighbor))
             return forward, reverse
         finally:
-            if self.collect_stats:
-                elapsed = time.perf_counter() - start
-                with self._stats_lock:
-                    self._query_count += 1
-                    self._total_seconds += elapsed
+            self._record_query(start, 1)
 
 
 def load_stage2_sql_provider(pre_dir, database, db_name="rel-f1") -> SqlNeighborProvider:

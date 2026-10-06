@@ -174,28 +174,50 @@ identities, and `sequence` as the usual list of `(name, value)` pairs. Set
 `legacy=True` before installing a provider to capture the pre-alignment policy;
 Rust tests retain a golden legacy trace.
 
-The SQL provider returns complete ordered forward/reverse neighbor IDs for one
-expanded node. Rust validates them against the encoded graph, then uses those
-SQL-returned IDs with graph metadata to retain its frontier, width RNG, shared
-visited depths, local/global budgets, deduplication, and masks. FK values are
+The default SQL route uses two-pass, item-local planning and replay. A graph
+planning pass records unique adjacency requests for only the nodes actually
+expanded before the cell budgets stop collection. One
+`query_many(node_idxs, target_node_idx, target_timestamp)` SQL call returns a map
+of complete ordered forward/reverse neighbor IDs. Rust replays the same build,
+validates each result against the encoded graph, and consumes SQL-returned IDs
+with graph metadata, retaining frontier order, width RNG, shared visited depths,
+local/global budgets, deduplication, and masks. Missing/malformed SQL results
+raise errors; there is no graph fallback. Request/result maps die with the item.
+
+This is not independent graph-free SQL traversal: the planning pass performs
+BFS discovery, and Stage 1 is recomputed with identical RNG in replay. Traces
+report `execution_route` and `execution_stats`, including two Stage 1 passes and
+one provider call per batched item. Reusing a Stage 1 plan may be a later
+optimization; current timings include both passes. FK values are
 **parent row positions**, not arbitrary PK values. SQL uses parameterized
 cutoffs, row-position joins, and `UNION ALL` to preserve duplicate FK paths.
 
 Source tables must match the physical DuckDB rows and encoded counts/timestamps.
 Every graph table and task split must be available, including local task
 manifests. Each process/thread lazily opens a read-only connection with temporary
-normalized row tables and an edge view. Connections/locks are excluded from
-pickling; persistent database tables are not modified. The provider still copies
-source row/FK metadata per querying thread; it is not a graph-free sampler.
+normalized row tables and an indexed temporary edge table. FK joins and list
+expansion run once per connection, rather than once per query. This is a
+SQL-wide adjacency index, not precomputed seed neighborhoods or context maps.
+Connections/locks are excluded from pickling; persistent database tables are not
+modified. The provider still copies source row/FK metadata and the edge index
+per querying thread, so memory/setup costs must be measured at production scale.
+
+The original callable per-node route remains available for comparison. Providers
+without callable `query_many` use it automatically; the comparison CLI selects
+the original edge-view route with `--sql-route scalar`. The default is
+`--sql-route batched`. Choose the route before opening provider connections.
 
 ### Validation and performance status
 
 `tests/test_sql_stage2.py` covers native BFS/SQL trace and batch parity, duplicate
 paths, multiple child tables and all task splits, equal/future timestamps,
 width-limited collection, budgets, deduplication, masks, thread/fresh-process
-pickle determinism, and rejection of source/neighbor mismatches. Rust has ten
-focused baseline/seam tests. Full DataLoader fork determinism and production
-revision parity remain unverified.
+pickle determinism, and rejection of source/neighbor mismatches. Batched tests
+also verify one query/item, request-only result maps, empty requests, scalar
+parity and coexistence with live DuckDB connections. Rust has fourteen focused
+baseline/seam tests, including concurrent batch items, callback errors, malformed
+maps and shared deadlines. Full DataLoader fork determinism and production-scale
+revision/timing checks remain pending locally.
 
 A bounded Mac CPU spike on a 100-node synthetic graph (80 walks, length 6,
 64 global cells, 32 local cells, width 1, ten warm repeats) measured:
@@ -205,12 +227,35 @@ A bounded Mac CPU spike on a 100-node synthetic graph (80 walks, length 6,
 | Aligned BFS | 0.152 ms | 0.070 ms |
 | On-demand Python/DuckDB prototype | 131.3 ms | 116.4 ms |
 
-The SQL measurements included 20 adjacency queries/item and graph validation.
-This route is **not accepted as a performance solution**. It provides a working
-correctness reference; plan step 4 still requires a batched/two-pass or native
-worker-local execution route. Do not interpret this tiny spike as rel-f1 timing.
-The cached rel-f1 source also lacks a required task manifest, so production
-source validation currently fails closed. No new CUDA timing or AUROC is claimed.
+The original SQL measurements included 20 adjacency queries/item and graph
+validation. A user-reported rel-f1 four-item smoke comparison passed with zero
+violations but took 37.600 s in SQL versus 0.105 s aligned BFS (phase times include
+validation/disk IO). This established correctness, not acceptable performance.
+
+### Optimization ledger
+
+Repeated same-fixture Mac measurements after the batching change (same 100-node
+graph/settings, three runs of ten warm items, cold setup kept separate):
+
+| Route | Cold item | Warm mean/item | Queries/item |
+| --- | ---: | ---: | ---: |
+| Aligned BFS | 0.086 ms | 0.075 ms | 0 |
+| Original scalar edge view | 162.2 ms | 134.86 ms | 20 |
+| Scalar with reusable edge index | 29.6 ms | 11.18 ms | 20 |
+| Batched plan/replay with edge index | 20.5 ms | 1.41 ms | 1 |
+
+Both index reuse and batching beat run-to-run variance and retain exact trace/
+sequence parity. Batched warm repeat means were 1.30–1.53 ms, versus
+127.4–143.9 ms for the scalar view: roughly a 96x reduction in this small test.
+First-connection edge/index setup was 19.0 ms and is included in the cold item.
+This is a local optimization win, **not** a claim of parity with BFS latency or
+full-scale readiness. The edge index is materialized per querying thread, and
+two-pass planning still does extra graph work. The next gate is the same user
+rel-f1 smoke command and then full-row/repeated timing with setup and memory.
+
+The local cached rel-f1 source lacks a required task manifest, so the agent's
+production-source validation still fails closed; the user's matching source
+passed the scalar smoke. No new CUDA timing or AUROC is claimed.
 
 ### Running equal-input comparisons
 
@@ -230,7 +275,16 @@ The checkpoint-independent harness records legacy/aligned/SQL traces, setup and
 per-item times, overlaps, label counts, query counts, temporal/mask/budget checks,
 and exact aligned BFS/SQL Stage 1 and encoded-sequence parity. Equal-time label
 counts are reported rather than rejected under the inclusive Algorithm 1 policy.
-Defaults cover all 726 test targets; no model or AUROC is involved.
+Defaults cover all 726 test targets; no model or AUROC is involved. Per-item
+JSON timings include connection/index setup count/time, requested-node count,
+query count/time and the Rust execution-route statistics. Query time includes
+lazy connection setup; the separately reported setup time is a subset, not an
+additional elapsed cost.
+
+Rebuild and rerun the previous small smoke with `--sql-route batched`, writing a
+new output file to preserve the original evidence. Use `--repeats 3` to separate
+first-connection setup from warm items. A `--sql-route scalar` run retains the
+old per-node reference if another controlled timing comparison is needed.
 
 For model scoring on the same CUDA machine, run `scripts/eval.py` twice with the
 same checkpoint, prepared data, seed and context settings, changing only

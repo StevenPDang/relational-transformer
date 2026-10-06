@@ -21,17 +21,28 @@ could not reproduce from source row offsets alone. Legacy tracing retains that
 stored order. This is a separately documented baseline policy change, not a SQL
 sampling-policy difference.
 
-The collector seam queries SQL once per expanded node, consumes its ordered IDs,
-and retains Rust frontier/RNG/visited-depth/cell logic. It validates SQL IDs and
-order against graph metadata. Source mapping is based on encoded row offsets and
-parent row-position FKs, with duplicate paths retained. No eager contexts or SQL
-seed-order maps are needed. Worker connections are lazy process/thread-local.
+The default collector now uses one SQL call per item, not per expanded node.
+Rust first discovers item-local adjacency requests using graph planning; SQL
+`query_many` retrieves exactly those requests; Rust replays with identical RNG,
+validates each result, and consumes SQL IDs. Both passes retain existing
+frontier/visited-depth/cell rules, and Stage 1 is currently computed twice.
+Source mapping uses encoded row offsets and parent row-position FKs, preserving
+duplicate paths. No eager contexts or SQL seed-order maps are needed. Worker
+connections are lazy process/thread-local and build a reusable temporary SQL
+edge index; index setup and replication memory are part of the comparison.
+The scalar edge-view route remains an explicit reference mode.
 
-Step 4's performance route remains open: the correctness spike measured about
-116.4 ms warm/item versus 0.070 ms BFS on a tiny synthetic graph, so this callback
-route is not performance-accepted. Full DataLoader/fork determinism, production
-source parity, and step 5's CUDA/726-row AUROC gates are pending. The available
-cached rel-f1 source lacks a required task manifest and fails validation.
+Step 4 has an implemented two-pass route with focused verification and a local
+performance win: repeated same-fixture warm means were 134.86 ms scalar/view,
+11.18 ms scalar/index, 1.41 ms batch/index, and 0.075 ms BFS. Cold batch time was
+20.5 ms, including 19.0 ms connection/index setup. These are tiny synthetic
+measurements, not rel-f1 predictions. A user-reported four-target rel-f1 scalar
+smoke passed with zero violations (37.600 s SQL, 0.105 s aligned BFS); the next
+gate is rerunning that input after rebuilding with the batched route.
+Full DataLoader/fork determinism, production-scale timing/memory, and step 5's
+CUDA/726-row AUROC gates are pending. The agent's available cached rel-f1 source
+still lacks a required task manifest and fails validation; the user's source
+successfully passed the original scalar smoke.
 See `tasks/todo.md`, `docs/sql-sampling.md`, and
 `scripts/compare_sql_stage2.py` for checks and reproduction commands.
 
