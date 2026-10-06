@@ -1,5 +1,32 @@
 # Small rel-f1 SQL sampling experiment
 
+## Target: replace Stage 2 only
+
+The intended translation is **Algorithm 1's Stage 2**: keep random-walk visit
+scoring and same-table candidate selection in Rust (Stage 1), then replace each
+`BFSCOLLECT(D, s, ℓ, b, t⋆, remaining_budget)` call with a SQL neighborhood
+query. The returned rows still pass through the existing cell-budget,
+deduplication, masking, and model-input code. Success means comparing SQL and
+BFS expansion with the *same* Stage 1 seeds and ordering, not merely obtaining
+a similar AUROC after changing both stages.
+
+The hybrid path below is closer to this target because it retains Rust's
+random-walk stage. The raw-data path is a separate feasibility experiment: it
+also replaces Stage 1 with SQL ordering. Its accuracy and 54-second setup cost
+therefore do not measure the performance or fidelity of a Stage-2-only design.
+Keeping the current Stage 1 also keeps its graph adjacency input unless that
+stage is changed in a separate experiment.
+The implementation steps and verification gates are in
+[the Stage 2 plan](../tasks/plan.md).
+
+Two details need an explicit choice before claiming equivalence to the stated
+algorithm. With `prefer_latest`, the current Rust code sorts by timestamp
+*before* visit count, whereas Algorithm 1 says score first and timestamp only
+breaks ties. Also, the pseudocode passes target time `t⋆` to `BFSCOLLECT`, while
+the current Rust expansion and materialized SQL neighborhoods use the seed's
+timestamp for local expansion. A Stage 2 replacement should be compared against
+the chosen semantics with identical Stage 1 output and temporal cutoffs.
+
 ## Compare SQL and BFS starting from raw data
 
 Use `--raw-dataset` instead of `--pre-dir` to include preparation in evaluation
@@ -68,6 +95,61 @@ tensors for identical SQL selections, including forward-key attention metadata.
 Both raw-data paths also produced complete 726-row submissions from the cached
 rel-f1 source with real preparation/embeddings/sampling and mock predictions.
 That smoke check does not measure model accuracy or GPU inference performance.
+
+## Challenges in translating sampling to SQL
+
+- **The sampler is more than graph traversal.** The Rust path uses random walks
+  to rank same-table task seeds and BFS to expand each seed. Raw SQL replaces
+  both with earlier task rows ordered by same driver and recency, then fixed
+  joins for local history. This changes which evidence the model sees, so SQL
+  is not an exact implementation of the BFS policy. `--num-walks` and
+  `--walk-length` cannot make the two paths equivalent.
+- **Context budgets make row order consequential.** An early SQL version put too
+  few historical labels in the model context. We moved earlier labels ahead of
+  database history and interleaved qualifying, standings, and results by
+  recency rank. The four-target sampling check below shows the resulting label
+  counts; it is a context check, not an accuracy measurement. Rust still
+  applies cell budgets, deduplication, masks, and temporal filtering after SQL
+  selects rows.
+- **SQL row IDs must match model node IDs.** The model consumes encoded cells
+  addressed by Rust node index, while DuckDB queries identify raw rows by
+  `rowid`. Joins therefore retain `rowid` explicitly and add each table's node
+  offset. The hybrid path verifies raw table order and values plus task counts
+  and timestamps against the preprocessed source. The raw path reads the same
+  Parquet files for both encoding and DuckDB import, avoiding that separate
+  source-alignment pass.
+- **Removing the traversal graph does not remove preprocessing.** SQL still
+  needs encoded cells, text embeddings, and foreign-key metadata for the model's
+  attention masks. On the measured runs, raw preparation took about five
+  seconds with either sampler; the SQL path did not gain a meaningful setup
+  advantage from omitting graph construction.
+- **Eager SQL work dominates this raw prototype's runtime.** Every possible
+  train, validation, and test task seed needs a neighborhood because it may be
+  selected as historical context. The current implementation materializes all
+  2,667 neighborhoods and each seed's ordered historical candidates before
+  evaluation. That repeated per-seed query work is the main cost, not
+  Python-to-Rust transfer.
+
+For the full 726-row test split, the reported AUROC was **0.909888 for raw SQL**
+and **0.911293 for raw BFS** (a 0.001404 difference). The latest timed CUDA
+runs, with `ctx-size=8192`, `local-ctx-size=256`, and `bfs-width=32`, reported:
+
+| Measure | Raw SQL | Raw BFS |
+| --- | ---: | ---: |
+| Raw data preparation | 5.23 s | 4.94 s |
+| Task and evaluator setup | 54.29 s | 0.09 s |
+| Evaluation and scoring | 54.23 s | 55.89 s |
+| Total | 114.67 s | 61.85 s |
+
+The AUROC difference is small on this test split; no uncertainty estimate was
+computed. The timed runs show SQL about 1.85 times slower. Earlier runs were
+similar (114.53 s for SQL, 61.67 s for BFS), though they lacked the setup
+breakdown. The latest SQL run's 54.29-second setup breaks down into 46.88 seconds
+for neighborhood queries and assembly, 6.96 seconds for historical seed queries,
+0.17 seconds for both Rust transfer/validation steps, and 0.28 seconds of other
+evaluator setup. These measurements explain the raw prototype's cost. The
+Stage-2-only target should measure its own SQL calls after holding Stage 1
+fixed; optimizing raw SQL's historical seed ordering is outside that target.
 
 ## Existing hybrid SQL path using prepared data
 
@@ -158,6 +240,7 @@ label counts were:
 | 8192 / 256 / 32 | 789–931 | 95–232 | 457–546 |
 
 The revised contexts include qualifying, standings and results. These are
-sampling checks, not model scores. No new AUROC comparison has been run; the
-existing FlexAttention CPU compilation path is unsupported on this Mac, so
+sampling checks, not model scores. No matched *hybrid* SQL/BFS AUROC comparison
+has been run; the raw-data CUDA comparison above uses a different seed policy.
+The existing FlexAttention CPU compilation path is unsupported on this Mac, so
 model evaluation requires the CUDA environment.
