@@ -56,6 +56,13 @@ breakdown is included in `raw data preparation`, so do not add it twice.
 Python imports and Pixi's native build/install step are outside that clock.
 CUDA is synchronized at evaluation timing boundaries.
 
+Raw SQL runs also report `setup_seconds` in `runtime.json` and print its stages:
+SQL neighborhood queries and assembly, historical seed queries, and separate
+Python-to-Rust transfer/validation for contexts and seed orders. `other evaluator
+setup` is the remaining time in `task and evaluator setup`, including evaluator
+construction and data-loader initialization. These are subdivisions of setup,
+not additional time to add to `total`.
+
 Verified locally: graph-free and graph-backed encoders produce identical model
 tensors for identical SQL selections, including forward-key attention metadata.
 Both raw-data paths also produced complete 726-row submissions from the cached

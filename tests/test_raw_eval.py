@@ -162,3 +162,14 @@ def test_raw_eval_cli_reports_full_split_and_preparation_runtime(raw_f1, zero_em
     assert runtime["seconds"]["total"] >= sum(
         value for name, value in runtime["seconds"].items() if name != "total")
     assert "text embeddings" in runtime["preparation_seconds"]
+    if sampler == "sql":
+        setup = runtime["setup_seconds"]
+        assert set(setup) == {
+            "SQL neighborhood queries and assembly", "SQL historical seed queries",
+            "Rust context transfer and validation", "Rust seed order transfer and validation",
+            "other evaluator setup",
+        }
+        assert all(value >= 0 for value in setup.values())
+        assert sum(setup.values()) == pytest.approx(runtime["seconds"]["task and evaluator setup"], abs=0.01)
+    else:
+        assert runtime["setup_seconds"] == {}

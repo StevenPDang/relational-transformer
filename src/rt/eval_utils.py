@@ -165,7 +165,7 @@ def build_evaluator(tasks, pre_dir, *, embedding_model, d_text, device, ctx_size
                     local_ctx_size=256, bfs_width=32, num_walks=10_000, walk_length=20,
                     tokens_per_gpu=2**18, items_per_task=None, num_workers=2, context_seed=0,
                     prefer_latest=True, shuffle_seed=0, mmap_populate=True,
-                    sql_context_db=None):
+                    sql_context_db=None, setup_timings=None):
     from rt.evaluator import Evaluator
 
     # mmap_populate=True by default: pre-fault the eval data into RAM so the
@@ -187,6 +187,7 @@ def build_evaluator(tasks, pre_dir, *, embedding_model, d_text, device, ctx_size
         shuffle_seed=shuffle_seed, context_seed=context_seed, vector_db_path=None,
         train_only_fallback=False,
         sql_context_db=sql_context_db,
+        setup_timings=setup_timings,
         global_rank=0, local_rank=0, world_size=1, ddp=False, device=device,
     )
 

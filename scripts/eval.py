@@ -99,6 +99,7 @@ def main() -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     timings = {}
     preparation_timings = {}
+    setup_timings = {}
 
     def report_runtime(label: str, since: float) -> float:
         # CUDA work is asynchronous; finish it before measuring elapsed time.
@@ -116,7 +117,8 @@ def main() -> None:
         (out / "runtime.json").write_text(json.dumps({
             "sampler": args.sampler if args.raw_dataset else ("sql-hybrid" if args.sql_context_db else "bfs"),
             "device": device, "seconds": timings,
-            "preparation_seconds": preparation_timings, "settings": vars(args),
+            "preparation_seconds": preparation_timings,
+            "setup_seconds": setup_timings, "settings": vars(args),
         }, indent=2) + "\n")
 
     net, config = load_rt_model(args.checkpoint, device=device, compile=False)
@@ -186,8 +188,14 @@ def main() -> None:
         raise SystemExit(f"no {task_type} tasks found in {args.pre_dir}")
     ev = build_evaluator(tasks, args.pre_dir, ctx_size=args.ctx_size,
                          local_ctx_size=args.local_ctx_size, bfs_width=args.bfs_width,
-                         **eval_kwargs)
+                         setup_timings=setup_timings, **eval_kwargs)
     evaluation_started_at = report_runtime("task and evaluator setup", setup_started_at)
+    if setup_timings:
+        setup_timings["other evaluator setup"] = max(
+            0.0, timings["task and evaluator setup"] - sum(setup_timings.values())
+        )
+        for label, seconds in setup_timings.items():
+            print(f"runtime | setup / {label}: {seconds:.2f}s", flush=True)
     run_and_report(net, tasks, args.pre_dir, ctx_size=args.ctx_size,
                    reg_metric=args.reg_metric, out_dir=args.out_dir, no_csv=args.no_csv,
                    evaluator=ev, embedding_model=config["embedding_model"])

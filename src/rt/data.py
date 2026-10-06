@@ -1,6 +1,7 @@
 import json
 import math
 import random
+import time
 from functools import cache
 from pathlib import Path
 
@@ -135,6 +136,7 @@ class RustlerDataset:
         vector_db_path: str | None,
         train_only_fallback: bool,
         sql_context_db: str | None = None,
+        setup_timings: dict[str, float] | None = None,
     ):
         if sql_context_db is not None and (
             not tasks or any(t.db_name != "rel-f1" or t.table_name != "driver-top3" for t in tasks)
@@ -255,9 +257,17 @@ class RustlerDataset:
             if graph_free:
                 from rt.sql_context import load_raw_rel_f1_contexts
 
-                contexts, orders = load_raw_rel_f1_contexts(pre_dir, sql_context_db, max(bfs_widths))
+                contexts, orders = load_raw_rel_f1_contexts(
+                    pre_dir, sql_context_db, max(bfs_widths), timings=setup_timings
+                )
+                tick = time.perf_counter()
                 self.sampler.set_sql_contexts_py("rel-f1", contexts)
+                if setup_timings is not None:
+                    setup_timings["Rust context transfer and validation"] = time.perf_counter() - tick
+                tick = time.perf_counter()
                 self.sampler.set_sql_seed_order_py("rel-f1", orders)
+                if setup_timings is not None:
+                    setup_timings["Rust seed order transfer and validation"] = time.perf_counter() - tick
             else:
                 from rt.sql_context import load_rel_f1_contexts
 

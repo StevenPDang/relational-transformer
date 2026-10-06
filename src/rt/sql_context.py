@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from itertools import zip_longest
 from pathlib import Path
 
@@ -156,7 +157,7 @@ def load_rel_f1_contexts(pre_dir, database, width):
         con.close()
 
 
-def load_raw_rel_f1_contexts(pre_dir, database, width):
+def load_raw_rel_f1_contexts(pre_dir, database, width, timings=None):
     """Select local rows and historical seeds directly from raw Parquet data.
 
     The cell encoder and DuckDB import consumed these exact files in physical
@@ -192,10 +193,20 @@ def load_raw_rel_f1_contexts(pre_dir, database, width):
         for driver_id, timestamp, node_idx in labels.itertuples(index=False, name=None):
             idx, driver = int(node_idx), int(driver_id)
             timestamp = pd.Timestamp(timestamp).to_pydatetime()
+            tick = time.perf_counter()
             contexts[idx] = [(idx, 0)] + query_context_nodes(con, info, driver, timestamp, width)
+            if timings is not None:
+                timings["SQL neighborhood queries and assembly"] = (
+                    timings.get("SQL neighborhood queries and assembly", 0.0) + time.perf_counter() - tick
+                )
+            tick = time.perf_counter()
             orders[idx] = [int(row[0]) for row in con.execute(
                 HISTORICAL_SEEDS_SQL, [timestamp, driver]
             ).fetchall()]
+            if timings is not None:
+                timings["SQL historical seed queries"] = (
+                    timings.get("SQL historical seed queries", 0.0) + time.perf_counter() - tick
+                )
         return contexts, orders
     finally:
         con.close()
