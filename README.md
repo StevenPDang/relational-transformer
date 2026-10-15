@@ -6,7 +6,7 @@
 [![Python](https://img.shields.io/pypi/pyversions/relational-transformer?logo=python&logoColor=white)](https://pypi.org/project/relational-transformer/)
 [![Quickstart in Colab](https://img.shields.io/badge/Colab-Quickstart-F9AB00?logo=googlecolab&logoColor=white)](https://colab.research.google.com/github/stanford-star/relational-transformer/blob/main/notebooks/quickstart.ipynb)
 [![BYOD in Colab](https://img.shields.io/badge/Colab-BYOD-F9AB00?logo=googlecolab&logoColor=white)](https://colab.research.google.com/github/stanford-star/relational-transformer/blob/main/notebooks/byod.ipynb)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](https://github.com/stanford-star/relational-transformer/blob/main/LICENSE)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/stanford-star/relational-transformer/blob/main/LICENSE)
 
 This repo is the official implementation
 of the **Relational Transformer (RT)** architecture
@@ -120,6 +120,6 @@ Additionally, if you use **RT-PluRel** please also cite:
 
 ## License
 
-MIT, see [LICENSE](https://github.com/stanford-star/relational-transformer/blob/main/LICENSE). The released checkpoints and datasets carry their
+Apache-2.0, see [LICENSE](https://github.com/stanford-star/relational-transformer/blob/main/LICENSE). The released checkpoints and datasets carry their
 own licences; "the Join" is assembled from third-party databases that keep
 theirs.

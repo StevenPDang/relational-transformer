@@ -1,7 +1,7 @@
 [package]
 name = "rustler"
 version = "1.10.0"
-license = "MIT"
+license = "Apache-2.0"
 description = "Native data-processing engine for the Relational Transformer (rt.rustler)."
 repository = "https://github.com/stanford-star/relational-transformer"
 edition = "2024"
