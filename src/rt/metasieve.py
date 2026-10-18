@@ -304,6 +304,17 @@ def select_metapaths(con, schema, entity_table, seeds, labels, task_type, *, hop
     }
 
 
+def keep_all_rules(schema, entity_table, hops=3):
+    """A rule set that keeps every metapath: the unpruned baseline."""
+    paths = enumerate_metapaths(schema, entity_table, hops)
+    return {
+        "entity_table": entity_table, "schema": schema,
+        "params": {"hops": hops, "strict": False, "keep_all": True},
+        "paths": [{"id": i, "path": [list(step) for step in path], "name": path_name(path),
+                   "hop": len(path), "cluster": "all", "keep": True} for i, path in enumerate(paths)],
+    }
+
+
 def kept_paths(rules):
     """Kept metapaths from a rule set, as tuples of steps in enumeration order."""
     return [tuple(tuple(step) for step in row["path"]) for row in rules["paths"] if row["keep"]]

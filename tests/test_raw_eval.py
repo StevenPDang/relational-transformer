@@ -63,7 +63,19 @@ def zero_embedder(monkeypatch):
     monkeypatch.setitem(sys.modules, "rt.embed", types.SimpleNamespace(TextEmbedder=Embedder))
 
 
-def dataset_kwargs(pre_dir, database=None):
+def keep_all_rules_file(raw_root, path):
+    """Unpruned MetaSieve rules for the fixture schema, written to ``path``."""
+    from rt.metasieve import keep_all_rules
+
+    specs = yaml.safe_load((raw_root / "manifest.yaml").read_text())["tables"]
+    schema = {name: {"pkey": spec["pkey"], "time": spec["time_col"], "fkeys": spec["fkeys"]}
+              for name, spec in specs.items()}
+    rules = keep_all_rules(schema, "drivers", hops=3)
+    path.write_text(json.dumps(rules))
+    return rules, str(path)
+
+
+def dataset_kwargs(pre_dir, database=None, rules=None):
     from rt.tasks import Task
 
     return dict(tasks=[Task("rel-f1", "driver-top3", "qualifying", "clf", split="test")],
@@ -72,7 +84,8 @@ def dataset_kwargs(pre_dir, database=None):
         embedding_model="test", d_text=8, shuffle_seed=0, context_seed=0, items_per_task=-1,
         quiet=True, bool_as_num=True, ignore_data_errors=False, skip_text_cols=False,
         mmap_populate=False, balance_labels=[False], timeout_per_item=5,
-        ablate_schema_semantics=False, vector_db_path=None, train_only_fallback=False, sql_context_db=database)
+        ablate_schema_semantics=False, vector_db_path=None, train_only_fallback=False, sql_context_db=database,
+        sql_context_rules=rules)
 
 
 def test_raw_sql_needs_no_traversal_graph_and_preserves_model_encoding(raw_f1, zero_embedder, tmp_path):
@@ -97,12 +110,13 @@ def test_raw_sql_needs_no_traversal_graph_and_preserves_model_encoding(raw_f1, z
     with pytest.raises(ValueError, match="BFS needs graph"):
         RustlerDataset(**dataset_kwargs(sql_dir))
 
-    contexts, orders = load_raw_rel_f1_contexts(sql_dir, database, 32)
+    rules, rules_path = keep_all_rules_file(raw_f1, tmp_path / "rules.json")
+    contexts, orders = load_raw_rel_f1_contexts(sql_dir, database, 32, rules)
     info = json.loads((sql_path / "table_info.json").read_text())
     test_start = info["driver-top3:Test"]["node_idx_offset"]
     # Earlier same-driver examples lead; no same-time test labels are candidates.
     assert all(idx < test_start or idx >= test_start + 2 for idx in orders[test_start])
-    sql_ds = RustlerDataset(**dataset_kwargs(sql_dir, database))
+    sql_ds = RustlerDataset(**dataset_kwargs(sql_dir, database, rules_path))
     bfs_ds = RustlerDataset(**dataset_kwargs(bfs_dir))
     bfs_ds.sampler.set_sql_contexts_py("rel-f1", contexts)
     bfs_ds.sampler.set_sql_seed_order_py("rel-f1", orders)
@@ -115,7 +129,7 @@ def test_raw_sql_needs_no_traversal_graph_and_preserves_model_encoding(raw_f1, z
     assert (sql_batch["f2p_nbr_idxs"] >= 0).any()
     assert (sql_batch["is_targets"].sum(dim=1) == 1).all()
     # Graph-free SQL must be invariant to walk settings, even nonzero ones.
-    random_kwargs = dataset_kwargs(sql_dir, database)
+    random_kwargs = dataset_kwargs(sql_dir, database, rules_path)
     random_kwargs.update(num_walks=0, walk_length=0)
     no_walk_ds = RustlerDataset(**random_kwargs)
     no_walk_batch = no_walk_ds._process_batch(no_walk_ds.sampler.batch_py(0, 2, 256))
@@ -148,16 +162,18 @@ def test_raw_eval_cli_reports_full_split_and_preparation_runtime(raw_f1, zero_em
     monkeypatch.setattr(cli, "load_rt_model", lambda *a, **kw: (MockModel(), {
         "task_type": "clf", "embedding_model": "test", "d_text": 8}))
     out = tmp_path / f"report-{sampler}"
+    rules = ["--sql-context-rules", keep_all_rules_file(raw_f1, tmp_path / "rules.json")[1]] \
+        if sampler == "sql" else []
     monkeypatch.setattr(sys, "argv", ["eval", "--checkpoint", "mock", "--raw-dataset", str(raw_f1),
         "--prepare-dir", str(tmp_path / f"prep-{sampler}"), "--sampler", sampler,
         "--out-dir", str(out), "--ctx-size", "256", "--local-ctx-size", "128",
-        "--tokens-per-gpu", "512", "--num-workers", "0"])
+        "--tokens-per-gpu", "512", "--num-workers", "0", *rules])
     cli.main()
     predictions = pd.read_csv(out / "rel-f1__driver-top3.csv")
     assert len(predictions) == 2
     assert set(predictions.driverId) == {0, 1}
     runtime = json.loads((out / "runtime.json").read_text())
-    assert runtime["sampler"] == sampler
+    assert runtime["sampler"] == ("sql+metasieve" if sampler == "sql" else sampler)
     assert "raw data preparation" in runtime["seconds"]
     assert runtime["seconds"]["total"] >= sum(
         value for name, value in runtime["seconds"].items() if name != "total")

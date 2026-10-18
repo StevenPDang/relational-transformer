@@ -1,95 +1,15 @@
-"""Non-recursive SQL neighborhoods for the rel-f1/driver-top3 experiment."""
+"""SQL neighborhoods for rel-f1/driver-top3 from MetaSieve-selected metapaths.
+
+Every seed's neighborhood and historical seed order are built in batched
+DuckDB queries over all task rows at once; ``rt.metasieve`` decides which
+relational paths a neighborhood follows.
+"""
 
 from __future__ import annotations
 
 import json
 import time
-from itertools import zip_longest
 from pathlib import Path
-
-
-# Keep rowid explicit across joins: Rust's node index is table offset + raw row.
-RECENT_DRIVER_ROWS_SQL = """
-SELECT r.rowid, race.rowid, constructor.rowid, circuit.rowid
-FROM (
-    SELECT rowid, raceId, {constructor_col} AS constructorId, date
-    FROM {table}
-    WHERE driverId = ? AND date <= ?
-    ORDER BY date DESC, rowid
-    LIMIT ?
-) r
-LEFT JOIN races race ON race.raceId = r.raceId AND race.date <= ?
-LEFT JOIN constructors constructor ON constructor.constructorId = r.constructorId
-LEFT JOIN circuits circuit ON circuit.circuitId = race.circuitId
-ORDER BY r.date DESC, r.rowid
-"""
-
-# Only these fixed table/column names are interpolated; values stay parameters.
-HISTORY_TABLES = (
-    ("qualifying", "constructorId"),
-    ("standings", "NULL::BIGINT"),
-    ("results", "constructorId"),
-)
-
-HISTORICAL_LABELS_SQL = """
-SELECT node_idx FROM sql_task_labels
-WHERE driverId = ? AND date < ?
-ORDER BY date DESC, node_idx
-LIMIT ?
-"""
-
-HISTORICAL_SEEDS_SQL = """
-SELECT node_idx FROM sql_task_labels
-WHERE date < ?
-ORDER BY (driverId = ?) DESC, date DESC, node_idx
-"""
-
-
-def query_context_nodes(con, table_info, driver_id, timestamp, width):
-    """Return ordered (Rust node index, relationship depth) pairs for one seed."""
-    if width <= 0:
-        raise ValueError("SQL context width must be positive")
-    nodes = []
-    seen = set()
-
-    def add(table, row, depth):
-        if row is None:
-            return
-        node = int(table_info[f"{table}:Db"]["node_idx_offset"]) + int(row)
-        if node not in seen:
-            seen.add(node)
-            nodes.append((node, depth))
-
-    for row, in con.execute('SELECT rowid FROM drivers WHERE driverId = ?', [driver_id]).fetchall():
-        add("drivers", row, 1)
-    # Labels are small, high-value rows. Emit them before DB histories so that
-    # the local cell budget cannot discard the entire label-neighbor query.
-    for node, in con.execute(
-        HISTORICAL_LABELS_SQL, [driver_id, timestamp, width]
-    ).fetchall():
-        if int(node) not in seen:
-            seen.add(int(node))
-            nodes.append((int(node), 2))
-
-    histories = [
-        con.execute(
-            RECENT_DRIVER_ROWS_SQL.format(table=table, constructor_col=constructor_col),
-            [driver_id, timestamp, width, timestamp],
-        ).fetchall()
-        for table, constructor_col in HISTORY_TABLES
-    ]
-    # Round-robin by recency rank: qualifying, standings, results, then their
-    # next-most-recent rows. Parents remain beside the row that references them.
-    for group in zip_longest(*histories):
-        for (table, _), row in zip(HISTORY_TABLES, group):
-            if row is None:
-                continue
-            idx, race, constructor, circuit = row
-            add(table, idx, 2)
-            add("races", race, 3)
-            add("constructors", constructor, 3)
-            add("circuits", circuit, 4)
-    return nodes
 
 
 BATCH_ENTITY_SQL = """
@@ -101,6 +21,13 @@ SELECT s.seed, l.node_idx FROM ms_ctx_seeds s
 JOIN sql_task_labels l ON l.driverId = s.key AND l.date < s.ts
 QUALIFY ROW_NUMBER() OVER (PARTITION BY s.seed ORDER BY l.date DESC, l.node_idx) <= ?
 ORDER BY s.seed, l.date DESC, l.node_idx
+"""
+
+# Every strictly earlier task row, same driver first, then most recent.
+BATCH_SEED_ORDER_SQL = """
+SELECT s.seed, l.node_idx FROM ms_ctx_seeds s
+JOIN sql_task_labels l ON l.date < s.ts
+ORDER BY s.seed, (l.driverId = s.key) DESC, l.date DESC, l.node_idx
 """
 
 
@@ -115,10 +42,9 @@ def load_metasieve_rules(path):
 def metasieve_context_nodes(con, table_info, rules, seeds, width):
     """Batched neighborhoods from kept MetaSieve metapaths, for every seed.
 
-    ``seeds`` has columns seed (task node index), key (driverId) and ts. Like
-    :func:`query_context_nodes`, each list holds the driver row, then the most
-    recent earlier labels, then DB rows; the DB rows come from the kept
-    metapaths instead of fixed joins.
+    ``seeds`` has columns seed (task node index), key (driverId) and ts. Each
+    list holds the driver row, then up to ``width`` most recent earlier labels,
+    then the DB rows the kept metapaths reach (see :func:`rt.metasieve.context_nodes`).
     """
     from rt import metasieve
 
@@ -143,6 +69,28 @@ def metasieve_context_nodes(con, table_info, rules, seeds, width):
     return contexts
 
 
+def historical_seed_orders(con, seeds):
+    """Candidate historical seeds for every seed, in one query.
+
+    Strictly earlier task rows, same driver first, then most recent; this
+    replaces random-walk ranking in raw SQL mode.
+    """
+    import numpy as np
+
+    orders = {int(seed): [] for seed in seeds["seed"]}
+    con.register("ms_ctx_seeds", seeds)
+    try:
+        rows = con.execute(BATCH_SEED_ORDER_SQL).fetchnumpy()
+    finally:
+        con.unregister("ms_ctx_seeds")
+    seed_col, node_col = np.asarray(rows["seed"]), np.asarray(rows["node_idx"])
+    if len(seed_col):
+        bounds = np.flatnonzero(np.diff(seed_col)) + 1
+        for chunk_seeds, chunk in zip(np.split(seed_col, bounds), np.split(node_col, bounds)):
+            orders[int(chunk_seeds[0])] = chunk.astype(int).tolist()
+    return orders
+
+
 def _seed_frame(splits):
     import pandas as pd
 
@@ -154,7 +102,7 @@ def _seed_frame(splits):
     })
 
 
-def load_rel_f1_contexts(pre_dir, database, width, rules=None):
+def load_rel_f1_contexts(pre_dir, database, width, rules):
     """Validate source alignment, then materialize all possible task seeds.
 
     All splits need neighborhoods because Rust may pick historical same-table
@@ -180,9 +128,8 @@ def load_rel_f1_contexts(pre_dir, database, width, rules=None):
     try:
         # Verify values and order, not just counts: rowid + offset must identify
         # the same raw row used by preprocessing. No assumptions about PK values.
-        for table in (
-            "drivers", "results", "qualifying", "standings", "races", "constructors", "circuits"
-        ):
+        # Check every table a metapath may reach, not only the history tables.
+        for table in sorted(rules["schema"]):
             raw = raw_db.table_dict[table].df.reset_index(drop=True)
             sql = con.execute(f'SELECT * FROM "{table}" ORDER BY rowid').df()
             if len(raw) != info[f"{table}:Db"]["num_nodes"]:
@@ -208,21 +155,13 @@ def load_rel_f1_contexts(pre_dir, database, width, rules=None):
                 raise ValueError(f"Preprocessed task timestamps differ for {split}")
             splits.append(rows)
         con.register("sql_task_labels", pd.concat(splits, ignore_index=True))
-        if rules is not None:
-            contexts = metasieve_context_nodes(con, info, rules, _seed_frame(splits), width)
-            return {seed: [(seed, 0)] + nodes for seed, nodes in contexts.items()}
-        contexts = {}
-        for rows in splits:
-            for driver_id, timestamp, node_idx in rows.itertuples(index=False, name=None):
-                contexts[int(node_idx)] = [(int(node_idx), 0)] + query_context_nodes(
-                    con, info, int(driver_id), timestamp.to_pydatetime(), width
-                )
-        return contexts
+        contexts = metasieve_context_nodes(con, info, rules, _seed_frame(splits), width)
+        return {seed: [(seed, 0)] + nodes for seed, nodes in contexts.items()}
     finally:
         con.close()
 
 
-def load_raw_rel_f1_contexts(pre_dir, database, width, timings=None, rules=None):
+def load_raw_rel_f1_contexts(pre_dir, database, width, rules, timings=None):
     """Select local rows and historical seeds directly from raw Parquet data.
 
     The cell encoder and DuckDB import consumed these exact files in physical
@@ -254,31 +193,16 @@ def load_raw_rel_f1_contexts(pre_dir, database, width, timings=None, rules=None)
     con = duckdb.connect(str(Path(database).expanduser()), read_only=True)
     try:
         con.register("sql_task_labels", labels)
-        contexts, orders = {}, {}
-        if rules is not None:
-            tick = time.perf_counter()
-            batched = metasieve_context_nodes(con, info, rules, _seed_frame(splits), width)
-            contexts = {seed: [(seed, 0)] + nodes for seed, nodes in batched.items()}
-            if timings is not None:
-                timings["SQL neighborhood queries and assembly"] = time.perf_counter() - tick
-        for driver_id, timestamp, node_idx in labels.itertuples(index=False, name=None):
-            idx, driver = int(node_idx), int(driver_id)
-            timestamp = pd.Timestamp(timestamp).to_pydatetime()
-            tick = time.perf_counter()
-            if rules is None:
-                contexts[idx] = [(idx, 0)] + query_context_nodes(con, info, driver, timestamp, width)
-            if timings is not None and rules is None:
-                timings["SQL neighborhood queries and assembly"] = (
-                    timings.get("SQL neighborhood queries and assembly", 0.0) + time.perf_counter() - tick
-                )
-            tick = time.perf_counter()
-            orders[idx] = [int(row[0]) for row in con.execute(
-                HISTORICAL_SEEDS_SQL, [timestamp, driver]
-            ).fetchall()]
-            if timings is not None:
-                timings["SQL historical seed queries"] = (
-                    timings.get("SQL historical seed queries", 0.0) + time.perf_counter() - tick
-                )
+        seeds = _seed_frame(splits)
+        tick = time.perf_counter()
+        batched = metasieve_context_nodes(con, info, rules, seeds, width)
+        contexts = {seed: [(seed, 0)] + nodes for seed, nodes in batched.items()}
+        if timings is not None:
+            timings["SQL neighborhood queries and assembly"] = time.perf_counter() - tick
+        tick = time.perf_counter()
+        orders = historical_seed_orders(con, seeds)
+        if timings is not None:
+            timings["SQL historical seed queries"] = time.perf_counter() - tick
         return contexts, orders
     finally:
         con.close()

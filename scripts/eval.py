@@ -49,7 +49,8 @@ def main() -> None:
                     help="fresh directory for raw-data preparation (must not exist); "
                          "default: prepare/ inside the run folder")
     ap.add_argument("--sampler", choices=["bfs", "sql"], default="bfs",
-                    help="raw-data sampler: bfs builds a graph; sql omits traversal edges and random walks")
+                    help="raw-data sampler: bfs builds a graph; sql builds MetaSieve neighborhoods "
+                         "(needs --sql-context-rules) and orders seeds in SQL instead of random walks")
     ap.add_argument("--embedding-batch-size", type=int, default=1024,
                     help="text-embedding batch size for raw-data preparation")
     ap.add_argument("--mode", default="simple", choices=["simple", "ensemble"],
@@ -73,11 +74,12 @@ def main() -> None:
     ap.add_argument("--local-ctx-size", type=int, default=256)
     ap.add_argument("--bfs-width", type=int, default=32)
     ap.add_argument("--sql-context-db", default=None,
-                    help="opt-in rel-f1/driver-top3 SQL neighborhoods from this DuckDB file; "
-                         "--bfs-width bounds each DB history and historical label rows per seed")
+                    help="opt-in rel-f1/driver-top3 SQL neighborhoods from this DuckDB file "
+                         "(needs --sql-context-rules); --bfs-width caps labels and reverse steps per seed")
     ap.add_argument("--sql-context-rules", default=None,
-                    help="MetaSieve rule-set JSON from scripts/metasieve.py: SQL neighborhoods follow "
-                         "its kept metapaths instead of the fixed rel-f1 joins (needs SQL sampling)")
+                    help="MetaSieve rule-set JSON from scripts/metasieve.py (e.g. "
+                         "runs/metasieve/rel-f1-driver-top3/latest.json); SQL neighborhoods follow "
+                         "its kept metapaths")
     ap.add_argument("--num-walks", type=int, default=10_000)
     ap.add_argument("--walk-length", type=int, default=20)
     ap.add_argument("--prefer-latest", action=argparse.BooleanOptionalAction, default=True,
@@ -106,8 +108,12 @@ def main() -> None:
         args.tasks = ["rel-f1/driver-top3"]
     elif args.prepare_dir or args.sampler != "bfs":
         ap.error("--prepare-dir and --sampler sql require --raw-dataset; use --sql-context-db with prepared data")
-    if args.sql_context_rules and not (args.sql_context_db or args.sampler == "sql"):
+    sql_sampling = bool(args.sql_context_db) or (bool(args.raw_dataset) and args.sampler == "sql")
+    if args.sql_context_rules and not sql_sampling:
         ap.error("--sql-context-rules requires --sql-context-db or --raw-dataset with --sampler sql")
+    if sql_sampling and not args.sql_context_rules:
+        ap.error("SQL sampling needs MetaSieve rules: run `python -m scripts.metasieve` and pass "
+                 "--sql-context-rules runs/metasieve/rel-f1-driver-top3/latest.json")
     if args.out_dir is None:
         from rt.run_dirs import eval_kind, eval_run_dir
 

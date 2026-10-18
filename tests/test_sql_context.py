@@ -1,48 +1,36 @@
-from datetime import datetime
-
 import duckdb
 import pandas as pd
 import pytest
 
-from rt.sql_context import query_context_nodes
+from rt.sql_context import historical_seed_orders
+
+# The per-seed query this batched version replaced; kept as the reference order.
+PER_SEED_ORDER_SQL = """
+SELECT node_idx FROM sql_task_labels
+WHERE date < ?
+ORDER BY (driverId = ?) DESC, date DESC, node_idx
+"""
 
 
-def test_sql_context_history_cutoff_order_and_node_mapping():
+def test_batched_seed_order_matches_per_seed_queries():
     con = duckdb.connect()
-    con.execute('CREATE TABLE drivers(driverId BIGINT)')
-    con.execute('INSERT INTO drivers VALUES (42), (7)')
-    con.execute('CREATE TABLE constructors(constructorId BIGINT)')
-    con.execute('INSERT INTO constructors VALUES (8)')
-    con.execute('CREATE TABLE circuits(circuitId BIGINT)')
-    con.execute('INSERT INTO circuits VALUES (9)')
-    con.execute('CREATE TABLE races(raceId BIGINT, circuitId BIGINT, date TIMESTAMP)')
-    con.execute("INSERT INTO races VALUES (12,9,'2020-01-01'),(13,9,'2020-01-03'),(14,9,'2020-01-02')")
-    con.execute('CREATE TABLE results(driverId BIGINT, raceId BIGINT, constructorId BIGINT, date TIMESTAMP)')
-    con.execute("INSERT INTO results VALUES (42,12,8,'2020-01-01'),(42,13,8,'2020-01-03'),(7,12,8,'2020-01-01'),(42,14,8,'2020-01-02')")
-    con.execute('CREATE TABLE qualifying AS SELECT * FROM results')
-    con.execute('CREATE TABLE standings AS SELECT driverId, raceId, date FROM results')
-    labels = pd.DataFrame({'node_idx': [501, 502, 503, 504], 'driverId': [42,42,42,7],
-                           'date': pd.to_datetime(['2019-01-01','2020-01-02','2020-01-03','2019-01-01'])})
-    con.register('sql_task_labels', labels)
-    info = {f'{table}:Db': {'node_idx_offset': offset} for table, offset in
-            [('drivers',100),('results',200),('races',300),('constructors',400),('circuits',450),
-             ('qualifying',600),('standings',700)]}
+    labels = pd.DataFrame({
+        "node_idx": [501, 502, 503, 504, 505, 506],
+        "driverId": [42, 42, 7, 7, 42, 9],
+        "date": pd.to_datetime(["2019-01-01", "2020-01-02", "2019-06-01",
+                                "2020-01-02", "2020-01-03", "2018-01-01"]),
+    })
+    con.register("sql_task_labels", labels)
+    seeds = pd.DataFrame({"seed": labels["node_idx"], "key": labels["driverId"], "ts": labels["date"]})
     try:
-        nodes = query_context_nodes(con, info, 42, datetime(2020,1,2), 1)
-        # Physical positions map to offsets, even when primary keys aren't positions.
-        assert nodes == [(100,1),(501,2),(603,2),(302,3),(400,3),(450,4),(703,2),(203,2)]
-        assert query_context_nodes(con, info, 42, datetime(2018,1,1), 1) == [(100,1)]
-        # Broad DB rows must not push labels or one history table behind another.
-        more = query_context_nodes(con, info, 42, datetime(2020,1,2), 2)
-        assert more[:2] == [(100,1),(501,2)]
-        history = [idx for idx, _ in more if idx in (600,603,700,703,200,203)]
-        assert history == [603,703,203,600,700,200]
-        con.execute('DELETE FROM standings WHERE rowid = 0')
-        uneven = query_context_nodes(con, info, 42, datetime(2020,1,2), 2)
-        history = [idx for idx, _ in uneven if idx in (600,603,700,703,200,203)]
-        assert history == [603,703,203,600,200]
-        with pytest.raises(ValueError, match='positive'):
-            query_context_nodes(con, info, 42, datetime(2020,1,2), 0)
+        orders = historical_seed_orders(con, seeds)
+        for seed, key, ts in seeds.itertuples(index=False, name=None):
+            expected = [n for n, in con.execute(PER_SEED_ORDER_SQL, [ts.to_pydatetime(), key]).fetchall()]
+            assert orders[seed] == expected
+        # Same driver first, then recency; same-time and later rows never appear.
+        assert orders[505] == [502, 501, 504, 503, 506]
+        assert orders[502] == [501, 503, 506]
+        assert orders[506] == []
     finally:
         con.close()
 

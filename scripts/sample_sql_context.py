@@ -15,8 +15,8 @@ def main():
     parser.add_argument('--width', type=int, default=8)
     parser.add_argument('--items', type=int, default=4)
     parser.add_argument('--num-walks', type=int, default=0)
-    parser.add_argument('--rules', default=None,
-                        help='MetaSieve rule-set JSON; neighborhoods follow its kept metapaths')
+    parser.add_argument('--rules', default='runs/metasieve/rel-f1-driver-top3/latest.json',
+                        help='MetaSieve rule-set JSON from scripts/metasieve.py')
     args = parser.parse_args()
     if min(args.items, args.ctx_size, args.local_ctx_size, args.width) <= 0:
         parser.error('items, context sizes, and width must be positive')
