@@ -11,14 +11,18 @@ directory* -- one ``<dataset>__<task>.csv`` prediction table per task -- that is
 scored with ``relbench.leaderboard.evaluate_task`` (AUROC for clf, NMAE for reg)
 and can be re-validated with ``python -m relbench.leaderboard <out-dir>``.
 
-For rel-f1/driver-top3, ``--raw-dataset`` plus a fresh ``--prepare-dir`` includes
-cell preparation, text embeddings, and graph construction (``--sampler bfs``)
-or raw SQL import (``--sampler sql``) in the reported runtime.
+For rel-f1/driver-top3, ``--raw-dataset`` includes cell preparation, text
+embeddings, and graph construction (``--sampler bfs``) or raw SQL import
+(``--sampler sql``) in the reported runtime, using a fresh ``--prepare-dir``.
+
+Without ``--out-dir``, each run gets its own timestamped folder grouped by task
+and run type, e.g. ``runs/eval/rel-f1-driver-top3/20261018-183012_raw-sql-metasieve/``
+(raw runs prepare into its ``prepare/`` subfolder).
 
 Single-process (one GPU). Example:
 
     pixi run --environment cuda124 eval --checkpoint checkpoints/rt-j/classification \\
-        --pre-dir stanford-star/relbench-preprocessed --out-dir eval_out
+        --pre-dir stanford-star/relbench-preprocessed
 """
 
 from __future__ import annotations
@@ -41,7 +45,9 @@ def main() -> None:
     inputs = ap.add_mutually_exclusive_group(required=True)
     inputs.add_argument("--pre-dir", help="preprocessed RelBench (local or Hub)")
     inputs.add_argument("--raw-dataset", help="raw rel-f1 directory or Hub spec; includes preparation in runtime")
-    ap.add_argument("--prepare-dir", help="fresh output directory for raw-data preparation (must not exist)")
+    ap.add_argument("--prepare-dir",
+                    help="fresh directory for raw-data preparation (must not exist); "
+                         "default: prepare/ inside the run folder")
     ap.add_argument("--sampler", choices=["bfs", "sql"], default="bfs",
                     help="raw-data sampler: bfs builds a graph; sql omits traversal edges and random walks")
     ap.add_argument("--embedding-batch-size", type=int, default=1024,
@@ -59,7 +65,10 @@ def main() -> None:
                     help="(ensemble mode) candidate 'local_ctx_size,bfs_width' configs")
     ap.add_argument("--ensemble-size", type=int, default=4,
                     help="(ensemble mode) number of context seeds to average on test")
-    ap.add_argument("--out-dir", default="eval_out")
+    ap.add_argument("--out-dir", default=None,
+                    help="submission + runtime.json folder; default: a new timestamped folder "
+                         "under --runs-dir/eval/<tasks>/")
+    ap.add_argument("--runs-dir", default="runs", help="root for default run folders")
     ap.add_argument("--ctx-size", type=int, default=8192)
     ap.add_argument("--local-ctx-size", type=int, default=256)
     ap.add_argument("--bfs-width", type=int, default=32)
@@ -83,9 +92,9 @@ def main() -> None:
     ap.add_argument("--reg-metric", default="mae", choices=["mae", "r2"])
     ap.add_argument("--no-csv", action="store_true")
     args = ap.parse_args()
+    if args.raw_dataset is not None and not args.raw_dataset.strip():
+        ap.error("--raw-dataset is empty; check that the path variable (e.g. $RAW) is set")
     if args.raw_dataset:
-        if not args.prepare_dir:
-            ap.error("--raw-dataset requires --prepare-dir (use a fresh directory for each benchmark run)")
         if args.sql_context_db:
             ap.error("raw SQL builds its own DuckDB database; omit --sql-context-db")
         if args.mode != "simple" or args.recipe != "relbench_eval_test":
@@ -99,6 +108,18 @@ def main() -> None:
         ap.error("--prepare-dir and --sampler sql require --raw-dataset; use --sql-context-db with prepared data")
     if args.sql_context_rules and not (args.sql_context_db or args.sampler == "sql"):
         ap.error("--sql-context-rules requires --sql-context-db or --raw-dataset with --sampler sql")
+    if args.out_dir is None:
+        from rt.run_dirs import eval_kind, eval_run_dir
+
+        kind = eval_kind(raw=bool(args.raw_dataset), sampler=args.sampler,
+                         sql_context_db=args.sql_context_db,
+                         sql_context_rules=args.sql_context_rules, mode=args.mode)
+        run_dir = eval_run_dir(args.runs_dir, args.tasks, kind)
+        run_dir.mkdir(parents=True)  # claim the name before the long run starts
+        args.out_dir = str(run_dir)
+    if args.raw_dataset and not args.prepare_dir:
+        args.prepare_dir = str(Path(args.out_dir).expanduser() / "prepare")
+    print(f"run folder: {args.out_dir}", flush=True)
 
     started_at = time.perf_counter()
     device = "cuda" if torch.cuda.is_available() else "cpu"

@@ -4,8 +4,10 @@ The JSON lists every enumerated metapath with its scores, GMM cluster and
 keep/drop decision. Pass it to ``eval --sql-context-rules`` to build SQL
 neighborhoods from the kept paths instead of the hand-written rel-f1 joins.
 
-    pixi run --environment mac python -m scripts.metasieve \\
-      --duckdb data/duckdb/rel-f1.duckdb --out metasieve/rel-f1-driver-top3.json
+Without ``--out`` it is written to ``runs/metasieve/<db>-<task>/<timestamp>.json``
+and ``latest.json`` in that folder is pointed at it.
+
+    pixi run --environment mac python -m scripts.metasieve --duckdb data/duckdb/rel-f1.duckdb
 """
 
 from __future__ import annotations
@@ -23,7 +25,10 @@ def main():
                         help="RelBench dataset (Hub spec or local path)")
     parser.add_argument("--task", default="driver-top3")
     parser.add_argument("--duckdb", default="data/duckdb/rel-f1.duckdb")
-    parser.add_argument("--out", required=True, help="output rule-set JSON")
+    parser.add_argument("--out", default=None,
+                        help="output rule-set JSON; default: a timestamped file under "
+                             "--runs-dir/metasieve/<db>-<task>/ plus latest.json")
+    parser.add_argument("--runs-dir", default="runs", help="root for the default output")
     parser.add_argument("--hops", type=int, default=3)
     parser.add_argument("--batches", type=int, default=8)
     parser.add_argument("--delta", type=float, default=0.3,
@@ -37,6 +42,7 @@ def main():
     import relbench
 
     from rt import metasieve
+    from rt.run_dirs import link_latest, rules_path
 
     tick = time.perf_counter()
     db = relbench.load_dataset(args.source).get_db(upto_test_timestamp=False)
@@ -59,9 +65,11 @@ def main():
         con.close()
     rules.update(source=args.source, task=args.task, task_type=task_type,
                  seconds=round(time.perf_counter() - tick, 2))
-    out = Path(args.out).expanduser()
+    out = Path(args.out).expanduser() if args.out else rules_path(args.runs_dir, args.source, args.task)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(rules, indent=2, default=str) + "\n")
+    if not args.out:
+        print(f"latest: {link_latest(out)}")
 
     kept = [row for row in rules["paths"] if row["keep"]]
     print(f"{len(kept)}/{len(rules['paths'])} metapaths kept in {rules['seconds']}s -> {out}")

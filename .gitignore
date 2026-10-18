@@ -30,6 +30,9 @@ scripts/release_checkpoints.py
 tea_debug.log
 scratch_logs/
 
+# eval run folders and MetaSieve rule sets (scripts/eval.py, scripts/metasieve.py)
+runs/
+
 # byod example: the dummy-DB generator is a local-only helper; the committed
 # mini-shop.duckdb it produces is what the notebook uses.
 examples/byod/make_duckdb.py

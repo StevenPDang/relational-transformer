@@ -162,6 +162,26 @@ sampling checks, not model scores. No new AUROC comparison has been run; the
 existing FlexAttention CPU compilation path is unsupported on this Mac, so
 model evaluation requires the CUDA environment.
 
+## Run folders
+
+Without `--out-dir`, every eval run writes its submission CSVs and
+`runtime.json` to a new folder named by start time and run type, grouped by
+task, and raw runs prepare into its `prepare/` subfolder:
+
+```text
+runs/eval/rel-f1-driver-top3/
+├── 20261018-183012_raw-bfs/
+│   ├── prepare/
+│   ├── rel-f1__driver-top3.csv
+│   └── runtime.json
+├── 20261018-184105_raw-sql-metasieve/
+└── 20261018-185230_prepared-sql/
+```
+
+Run types are `raw-` or `prepared-` plus the sampler (`bfs`, `sql`, with
+`-metasieve` for rules and `-ensemble` in ensemble mode). Pass `--out-dir` and
+`--prepare-dir` to choose paths yourself; `--runs-dir` moves the root.
+
 ## MetaSieve-selected neighborhoods
 
 Instead of the fixed rel-f1 joins, `--sql-context-rules` builds each seed's
@@ -175,11 +195,11 @@ is kept if it or any descendant is good. Rules apply to whole metapaths; unlike
 the paper's PyG approximation, nothing is pruned by terminal table alone.
 
 ```bash
-pixi run --environment cuda124 python -m scripts.metasieve \
-  --duckdb data/duckdb/rel-f1.duckdb --out metasieve/rel-f1-driver-top3.json
+pixi run --environment cuda124 python -m scripts.metasieve --duckdb data/duckdb/rel-f1.duckdb
 ```
 
-The JSON lists every metapath with its scores, cluster and keep decision. On
+It writes `runs/metasieve/rel-f1-driver-top3/<timestamp>.json` and points
+`latest.json` in that folder at it (`--out` picks a path instead). The JSON lists every metapath with its scores, cluster and keep decision. On
 rel-f1/driver-top3 it keeps 28 of 34; the six dropped paths all fan out from a
 race to every other driver's qualifying, standings or results rows.
 
@@ -190,9 +210,9 @@ existing meaning:
 pixi run --environment cuda124 eval \
   --checkpoint checkpoints/rt-j/classification \
   --pre-dir stanford-star/relbench-preprocessed \
-  --tasks rel-f1/driver-top3 --out-dir eval_sql_metasieve \
+  --tasks rel-f1/driver-top3 \
   --sql-context-db data/duckdb/rel-f1.duckdb \
-  --sql-context-rules metasieve/rel-f1-driver-top3.json \
+  --sql-context-rules runs/metasieve/rel-f1-driver-top3/latest.json \
   --ctx-size 8192 --local-ctx-size 256 --bfs-width 32 \
   --num-walks 10000 --walk-length 20 --prefer-latest --shuffle-seed 0
 ```
