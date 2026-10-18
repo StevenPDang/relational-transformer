@@ -92,7 +92,69 @@ def query_context_nodes(con, table_info, driver_id, timestamp, width):
     return nodes
 
 
-def load_rel_f1_contexts(pre_dir, database, width):
+BATCH_ENTITY_SQL = """
+SELECT s.seed, d.rowid FROM ms_ctx_seeds s JOIN drivers d ON d.driverId = s.key
+"""
+
+BATCH_LABELS_SQL = """
+SELECT s.seed, l.node_idx FROM ms_ctx_seeds s
+JOIN sql_task_labels l ON l.driverId = s.key AND l.date < s.ts
+QUALIFY ROW_NUMBER() OVER (PARTITION BY s.seed ORDER BY l.date DESC, l.node_idx) <= ?
+ORDER BY s.seed, l.date DESC, l.node_idx
+"""
+
+
+def load_metasieve_rules(path):
+    """Read a rule set written by scripts/metasieve.py for rel-f1/driver-top3."""
+    rules = json.loads(Path(path).expanduser().read_text())
+    if rules.get("entity_table") != "drivers":
+        raise ValueError("MetaSieve rules must be selected from the drivers entity table")
+    return rules
+
+
+def metasieve_context_nodes(con, table_info, rules, seeds, width):
+    """Batched neighborhoods from kept MetaSieve metapaths, for every seed.
+
+    ``seeds`` has columns seed (task node index), key (driverId) and ts. Like
+    :func:`query_context_nodes`, each list holds the driver row, then the most
+    recent earlier labels, then DB rows; the DB rows come from the kept
+    metapaths instead of fixed joins.
+    """
+    from rt import metasieve
+
+    if width <= 0:
+        raise ValueError("SQL context width must be positive")
+    driver_offset = int(table_info["drivers:Db"]["node_idx_offset"])
+    contexts = {int(seed): [] for seed in seeds["seed"]}
+    con.register("ms_ctx_seeds", seeds)
+    try:
+        for seed, row in con.execute(BATCH_ENTITY_SQL).fetchall():
+            contexts[int(seed)].append((driver_offset + int(row), 1))
+        for seed, node in con.execute(BATCH_LABELS_SQL, [width]).fetchall():
+            contexts[int(seed)].append((int(node), 2))
+    finally:
+        con.unregister("ms_ctx_seeds")
+    paths = metasieve.kept_paths(rules)
+    rows = metasieve.path_rows(con, rules["schema"], "drivers", seeds, paths, width,
+                               strict=rules["params"].get("strict", False))
+    for seed, nodes in metasieve.context_nodes(rows, table_info).items():
+        seen = {node for node, _ in contexts[seed]}
+        contexts[seed].extend((node, depth) for node, depth in nodes if node not in seen)
+    return contexts
+
+
+def _seed_frame(splits):
+    import pandas as pd
+
+    labels = pd.concat(splits, ignore_index=True)
+    return pd.DataFrame({
+        "seed": labels["node_idx"].astype("int64"),
+        "key": labels["driverId"].astype("int64"),
+        "ts": pd.to_datetime(labels["date"]),
+    })
+
+
+def load_rel_f1_contexts(pre_dir, database, width, rules=None):
     """Validate source alignment, then materialize all possible task seeds.
 
     All splits need neighborhoods because Rust may pick historical same-table
@@ -146,6 +208,9 @@ def load_rel_f1_contexts(pre_dir, database, width):
                 raise ValueError(f"Preprocessed task timestamps differ for {split}")
             splits.append(rows)
         con.register("sql_task_labels", pd.concat(splits, ignore_index=True))
+        if rules is not None:
+            contexts = metasieve_context_nodes(con, info, rules, _seed_frame(splits), width)
+            return {seed: [(seed, 0)] + nodes for seed, nodes in contexts.items()}
         contexts = {}
         for rows in splits:
             for driver_id, timestamp, node_idx in rows.itertuples(index=False, name=None):
@@ -157,7 +222,7 @@ def load_rel_f1_contexts(pre_dir, database, width):
         con.close()
 
 
-def load_raw_rel_f1_contexts(pre_dir, database, width, timings=None):
+def load_raw_rel_f1_contexts(pre_dir, database, width, timings=None, rules=None):
     """Select local rows and historical seeds directly from raw Parquet data.
 
     The cell encoder and DuckDB import consumed these exact files in physical
@@ -190,12 +255,19 @@ def load_raw_rel_f1_contexts(pre_dir, database, width, timings=None):
     try:
         con.register("sql_task_labels", labels)
         contexts, orders = {}, {}
+        if rules is not None:
+            tick = time.perf_counter()
+            batched = metasieve_context_nodes(con, info, rules, _seed_frame(splits), width)
+            contexts = {seed: [(seed, 0)] + nodes for seed, nodes in batched.items()}
+            if timings is not None:
+                timings["SQL neighborhood queries and assembly"] = time.perf_counter() - tick
         for driver_id, timestamp, node_idx in labels.itertuples(index=False, name=None):
             idx, driver = int(node_idx), int(driver_id)
             timestamp = pd.Timestamp(timestamp).to_pydatetime()
             tick = time.perf_counter()
-            contexts[idx] = [(idx, 0)] + query_context_nodes(con, info, driver, timestamp, width)
-            if timings is not None:
+            if rules is None:
+                contexts[idx] = [(idx, 0)] + query_context_nodes(con, info, driver, timestamp, width)
+            if timings is not None and rules is None:
                 timings["SQL neighborhood queries and assembly"] = (
                     timings.get("SQL neighborhood queries and assembly", 0.0) + time.perf_counter() - tick
                 )

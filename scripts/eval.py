@@ -66,6 +66,9 @@ def main() -> None:
     ap.add_argument("--sql-context-db", default=None,
                     help="opt-in rel-f1/driver-top3 SQL neighborhoods from this DuckDB file; "
                          "--bfs-width bounds each DB history and historical label rows per seed")
+    ap.add_argument("--sql-context-rules", default=None,
+                    help="MetaSieve rule-set JSON from scripts/metasieve.py: SQL neighborhoods follow "
+                         "its kept metapaths instead of the fixed rel-f1 joins (needs SQL sampling)")
     ap.add_argument("--num-walks", type=int, default=10_000)
     ap.add_argument("--walk-length", type=int, default=20)
     ap.add_argument("--prefer-latest", action=argparse.BooleanOptionalAction, default=True,
@@ -94,6 +97,8 @@ def main() -> None:
         args.tasks = ["rel-f1/driver-top3"]
     elif args.prepare_dir or args.sampler != "bfs":
         ap.error("--prepare-dir and --sampler sql require --raw-dataset; use --sql-context-db with prepared data")
+    if args.sql_context_rules and not (args.sql_context_db or args.sampler == "sql"):
+        ap.error("--sql-context-rules requires --sql-context-db or --raw-dataset with --sampler sql")
 
     started_at = time.perf_counter()
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -115,7 +120,8 @@ def main() -> None:
         out = Path(args.out_dir).expanduser()
         out.mkdir(parents=True, exist_ok=True)
         (out / "runtime.json").write_text(json.dumps({
-            "sampler": args.sampler if args.raw_dataset else ("sql-hybrid" if args.sql_context_db else "bfs"),
+            "sampler": (args.sampler if args.raw_dataset else ("sql-hybrid" if args.sql_context_db else "bfs"))
+                       + ("+metasieve" if args.sql_context_rules else ""),
             "device": device, "seconds": timings,
             "preparation_seconds": preparation_timings,
             "setup_seconds": setup_timings, "settings": vars(args),
@@ -161,6 +167,7 @@ def main() -> None:
         num_workers=args.num_workers,
         prefer_latest=args.prefer_latest, shuffle_seed=args.shuffle_seed,
         sql_context_db=args.sql_context_db,
+        sql_context_rules=args.sql_context_rules,
     )
 
     if args.mode == "ensemble":

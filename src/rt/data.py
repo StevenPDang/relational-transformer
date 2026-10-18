@@ -137,7 +137,10 @@ class RustlerDataset:
         train_only_fallback: bool,
         sql_context_db: str | None = None,
         setup_timings: dict[str, float] | None = None,
+        sql_context_rules: str | None = None,
     ):
+        if sql_context_rules is not None and sql_context_db is None:
+            raise ValueError("MetaSieve rules require SQL context sampling")
         if sql_context_db is not None and (
             not tasks or any(t.db_name != "rel-f1" or t.table_name != "driver-top3" for t in tasks)
         ):
@@ -254,11 +257,16 @@ class RustlerDataset:
         self.num_items = self.sampler.num_items
 
         if sql_context_db is not None:
+            rules = None
+            if sql_context_rules is not None:
+                from rt.sql_context import load_metasieve_rules
+
+                rules = load_metasieve_rules(sql_context_rules)
             if graph_free:
                 from rt.sql_context import load_raw_rel_f1_contexts
 
                 contexts, orders = load_raw_rel_f1_contexts(
-                    pre_dir, sql_context_db, max(bfs_widths), timings=setup_timings
+                    pre_dir, sql_context_db, max(bfs_widths), timings=setup_timings, rules=rules
                 )
                 tick = time.perf_counter()
                 self.sampler.set_sql_contexts_py("rel-f1", contexts)
@@ -271,7 +279,7 @@ class RustlerDataset:
             else:
                 from rt.sql_context import load_rel_f1_contexts
 
-                contexts = load_rel_f1_contexts(pre_dir, sql_context_db, max(bfs_widths))
+                contexts = load_rel_f1_contexts(pre_dir, sql_context_db, max(bfs_widths), rules=rules)
                 self.sampler.set_sql_contexts_py("rel-f1", contexts)
 
         self.d_text = d_text

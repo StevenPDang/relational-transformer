@@ -15,6 +15,8 @@ def main():
     parser.add_argument('--width', type=int, default=8)
     parser.add_argument('--items', type=int, default=4)
     parser.add_argument('--num-walks', type=int, default=0)
+    parser.add_argument('--rules', default=None,
+                        help='MetaSieve rule-set JSON; neighborhoods follow its kept metapaths')
     args = parser.parse_args()
     if min(args.items, args.ctx_size, args.local_ctx_size, args.width) <= 0:
         parser.error('items, context sizes, and width must be positive')
@@ -36,6 +38,7 @@ def main():
         bfs_width=args.width, num_walks=args.num_walks, walk_length=20,
         tokens_per_gpu=args.items * args.ctx_size, items_per_task=args.items,
         num_workers=0, mmap_populate=False, sql_context_db=args.duckdb,
+        sql_context_rules=args.rules,
     )
     batch = next(evaluator.eval_loader_iters[task])
     summaries = []

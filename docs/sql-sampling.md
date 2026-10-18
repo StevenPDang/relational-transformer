@@ -161,3 +161,60 @@ The revised contexts include qualifying, standings and results. These are
 sampling checks, not model scores. No new AUROC comparison has been run; the
 existing FlexAttention CPU compilation path is unsupported on this Mac, so
 model evaluation requires the CUDA environment.
+
+## MetaSieve-selected neighborhoods
+
+Instead of the fixed rel-f1 joins, `--sql-context-rules` builds each seed's
+neighborhood from metapaths that MetaSieve (Khan & Aboulnaga, 2026) keeps for
+the task. Selection is a separate step that scores every schema-valid metapath
+up to three hops from per-seed SQL counts and the **train** labels:
+mutual information of log-count and log-rate with the label, divided by fanout
+cost, plus coverage, summarized by a lower confidence bound over seed batches
+and split into good and bad paths with a two-component Gaussian mixture. A path
+is kept if it or any descendant is good. Rules apply to whole metapaths; unlike
+the paper's PyG approximation, nothing is pruned by terminal table alone.
+
+```bash
+pixi run --environment cuda124 python -m scripts.metasieve \
+  --duckdb data/duckdb/rel-f1.duckdb --out metasieve/rel-f1-driver-top3.json
+```
+
+The JSON lists every metapath with its scores, cluster and keep decision. On
+rel-f1/driver-top3 it keeps 28 of 34; the six dropped paths all fan out from a
+race to every other driver's qualifying, standings or results rows.
+
+Pass it to either SQL mode; walks, seed order, widths and budgets keep their
+existing meaning:
+
+```bash
+pixi run --environment cuda124 eval \
+  --checkpoint checkpoints/rt-j/classification \
+  --pre-dir stanford-star/relbench-preprocessed \
+  --tasks rel-f1/driver-top3 --out-dir eval_sql_metasieve \
+  --sql-context-db data/duckdb/rel-f1.duckdb \
+  --sql-context-rules metasieve/rel-f1-driver-top3.json \
+  --ctx-size 8192 --local-ctx-size 256 --bfs-width 32 \
+  --num-walks 10000 --walk-length 20 --prefer-latest --shuffle-seed 0
+```
+
+Each neighborhood keeps the fixed path's head: the driver row, then up to
+`--bfs-width` earlier labels. DB rows follow in two groups. The spine comes
+first: hop-1 history rows (qualifying, standings, results) round-robin by
+recency, each followed by its forward parents (race, circuit, constructor).
+Fan-out rows past a later reverse step (constructor results and standings,
+other drivers' rows in the same race) follow, so they only use budget the
+spine leaves. Reverse steps are capped at `--bfs-width` rows per seed and path.
+Neighborhoods for all seeds are built with one set of frontier tables instead
+of per-seed queries.
+
+Sampling checks on four test targets with 10,000 walks (no model scores):
+
+| Context / local cells / width | Fixed joins | MetaSieve |
+| --- | --- | --- |
+| 256 / 128 / 8 | identical spine; 2–16 labels | same contexts for 3 of 4 targets |
+| 8192 / 256 / 32 | 293–398 labels, no constructor history | 102–267 labels, 411–710 constructor result/standing rows |
+
+At large budgets the extra paths displace some historical seeds, so contexts
+carry fewer labels. Whether that trade helps is what the GPU comparison measures.
+Code: `src/rt/metasieve.py`, `scripts/metasieve.py`, tests in
+`tests/test_metasieve.py`.
