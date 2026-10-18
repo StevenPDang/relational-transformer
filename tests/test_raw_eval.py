@@ -65,12 +65,14 @@ def zero_embedder(monkeypatch):
 
 def keep_all_rules_file(raw_root, path):
     """Unpruned MetaSieve rules for the fixture schema, written to ``path``."""
-    from rt.metasieve import keep_all_rules
+    from rt.metasieve import keep_all_rules, task_info
 
     specs = yaml.safe_load((raw_root / "manifest.yaml").read_text())["tables"]
     schema = {name: {"pkey": spec["pkey"], "time": spec["time_col"], "fkeys": spec["fkeys"]}
               for name, spec in specs.items()}
-    rules = keep_all_rules(schema, "drivers", hops=3)
+    task = task_info(schema, db="rel-f1", name="driver-top3", entity_table="drivers", entity_col="driverId",
+                     time_col="date", target_col="qualifying", task_type="clf")
+    rules = keep_all_rules(schema, task, hops=3)
     path.write_text(json.dumps(rules))
     return rules, str(path)
 
@@ -91,7 +93,7 @@ def dataset_kwargs(pre_dir, database=None, rules=None):
 def test_raw_sql_needs_no_traversal_graph_and_preserves_model_encoding(raw_f1, zero_embedder, tmp_path):
     import torch
     from rt.data import RustlerDataset
-    from rt.sql_context import load_raw_rel_f1_contexts
+    from rt.sql_context import load_raw_contexts
 
     sql_dir, database, sql_times = prepare_raw_eval(str(raw_f1), tmp_path / "sql", sampler="sql",
         embedding_model="test", d_text=8, device="cpu")
@@ -111,7 +113,7 @@ def test_raw_sql_needs_no_traversal_graph_and_preserves_model_encoding(raw_f1, z
         RustlerDataset(**dataset_kwargs(sql_dir))
 
     rules, rules_path = keep_all_rules_file(raw_f1, tmp_path / "rules.json")
-    contexts, orders = load_raw_rel_f1_contexts(sql_dir, database, 32, rules)
+    contexts, orders = load_raw_contexts(sql_dir, database, "rel-f1", "driver-top3", 32, rules)
     info = json.loads((sql_path / "table_info.json").read_text())
     test_start = info["driver-top3:Test"]["node_idx_offset"]
     # Earlier same-driver examples lead; no same-time test labels are candidates.

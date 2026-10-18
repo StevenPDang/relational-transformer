@@ -2,9 +2,10 @@
 
 MetaSieve (Khan & Aboulnaga, 2026) scores each schema-valid metapath extension
 from per-seed SQL counts and the task labels, then prunes the uninformative
-ones. Here the kept metapaths replace the hand-written rel-f1 joins in
-``rt.sql_context``: each seed's neighborhood is the rows its kept metapaths
-reach, so the context budget is spent only on label-relevant paths.
+ones. ``rt.sql_context`` builds each seed's neighborhood from the rows its
+kept metapaths reach, so the context budget is spent only on label-relevant
+paths. Nothing here is specific to one database: the schema and the task's
+entity table come from the rule set.
 
 Two deliberate differences from the paper:
 - Every frontier table holds all seeds at once instead of one batch per worker.
@@ -33,6 +34,25 @@ def relbench_schema(db):
         }
         for name, table in db.table_dict.items()
     }
+
+
+def task_info(schema, *, db, name, entity_table, entity_col, time_col, target_col, task_type):
+    """Task metadata a rule set carries so samplers need no database knowledge."""
+    if task_type not in ("clf", "reg"):
+        raise ValueError(f"Unknown task type: {task_type}")
+    pkey = schema[entity_table]["pkey"]
+    if not pkey:
+        raise ValueError(f"Entity table {entity_table} has no primary key")
+    return {"db": db, "name": name, "entity_table": entity_table, "entity_col": entity_col,
+            "entity_pkey": pkey, "time_col": time_col, "target_col": target_col, "task_type": task_type}
+
+
+def relbench_task_info(schema, db, name, task):
+    """:func:`task_info` from a ``relbench`` task object (which does not know its name)."""
+    task_type = "reg" if "regression" in str(task.task_type).lower() else "clf"
+    return task_info(schema, db=db, name=name, entity_table=task.entity_table,
+                     entity_col=task.entity_col, time_col=task.time_col,
+                     target_col=task.target_col, task_type=task_type)
 
 
 def enumerate_metapaths(schema, entity_table, hops):
@@ -165,20 +185,28 @@ class _Frontiers:
         self.con.unregister("ms_seeds_df")
 
 
-def path_counts(con, schema, entity_table, seeds, paths, strict=False):
-    """Distinct rows reached per seed for each path: DataFrame (seed x path)."""
+def path_counts(con, schema, entity_table, seeds, paths, strict=False, chunk=20_000):
+    """Distinct rows reached per seed for each path: DataFrame (seed x path).
+
+    Frontiers are built ``chunk`` seeds at a time; high-fanout paths on large
+    databases can otherwise exhaust memory.
+    """
     import pandas as pd
 
-    frontiers = _Frontiers(con, schema, entity_table, seeds, strict)
-    try:
-        counts = pd.DataFrame(index=pd.Index(seeds["seed"].astype("int64"), name="seed"))
-        for i, path in enumerate(paths):
-            table = frontiers.get(path)
-            n = con.execute(f"SELECT seed, COUNT(*) AS n FROM {table} GROUP BY seed").df()
-            counts[i] = n.set_index("seed")["n"].reindex(counts.index, fill_value=0).astype("float64")
-        return counts
-    finally:
-        frontiers.close()
+    parts = []
+    for start in range(0, len(seeds), chunk):
+        part = seeds.iloc[start:start + chunk]
+        frontiers = _Frontiers(con, schema, entity_table, part, strict)
+        try:
+            counts = pd.DataFrame(index=pd.Index(part["seed"].astype("int64"), name="seed"))
+            for i, path in enumerate(paths):
+                table = frontiers.get(path)
+                n = con.execute(f"SELECT seed, COUNT(*) AS n FROM {table} GROUP BY seed").df()
+                counts[i] = n.set_index("seed")["n"].reindex(counts.index, fill_value=0).astype("float64")
+            parts.append(counts)
+        finally:
+            frontiers.close()
+    return pd.concat(parts) if parts else pd.DataFrame(index=pd.Index([], name="seed"))
 
 
 def _entropy(y, task_type, bins):
@@ -285,30 +313,36 @@ def score_metapaths(counts, paths, labels, task_type, num_batches=8, delta=0.3, 
     return df.drop(columns=["max_coverage"]).to_dict("records")
 
 
-def select_metapaths(con, schema, entity_table, seeds, labels, task_type, *, hops=3,
-                     num_batches=8, delta=0.3, strict=False):
-    """Enumerate, count, and score metapaths; return the JSON-ready rule set."""
+def select_metapaths(con, schema, task, seeds, labels, *, hops=3, num_batches=8, delta=0.3,
+                     strict=False):
+    """Enumerate, count, and score metapaths; return the JSON-ready rule set.
+
+    ``task`` comes from :func:`task_info`; ``seeds`` (seed, key, ts) are the
+    labeled training rows to score on and ``labels`` is aligned with them.
+    """
+    entity_table = task["entity_table"]
     paths = enumerate_metapaths(schema, entity_table, hops)
     counts = path_counts(con, schema, entity_table, seeds, paths, strict=strict)
-    scored = score_metapaths(counts, paths, labels, task_type, num_batches, delta)
+    scored = score_metapaths(counts, paths, labels, task["task_type"], num_batches, delta)
     for row in scored:
         row["path"] = [list(step) for step in row["path"]]
         for key in ("lcb_count", "lcb_rate", "lcb_coverage", "q"):
             value = row.get(key)
             row[key] = None if value is None or (isinstance(value, float) and math.isnan(value)) else value
     return {
-        "entity_table": entity_table, "schema": schema,
+        "task": task, "entity_table": entity_table, "schema": schema,
         "params": {"hops": hops, "num_batches": num_batches, "delta": delta,
                    "strict": strict, "num_seeds": len(seeds)},
         "paths": scored,
     }
 
 
-def keep_all_rules(schema, entity_table, hops=3):
+def keep_all_rules(schema, task, hops=3):
     """A rule set that keeps every metapath: the unpruned baseline."""
+    entity_table = task["entity_table"]
     paths = enumerate_metapaths(schema, entity_table, hops)
     return {
-        "entity_table": entity_table, "schema": schema,
+        "task": task, "entity_table": entity_table, "schema": schema,
         "params": {"hops": hops, "strict": False, "keep_all": True},
         "paths": [{"id": i, "path": [list(step) for step in path], "name": path_name(path),
                    "hop": len(path), "cluster": "all", "keep": True} for i, path in enumerate(paths)],
@@ -359,9 +393,8 @@ def context_nodes(rows, table_info):
 
     Spine rows come first: hop-1 history rows interleaved by root rank across
     hop-1 paths (most recent first, round-robin over history tables), each
-    followed by its forward parents, as in the hand-written rel-f1
-    neighborhoods. Rows past a later reverse step fan out (e.g. other drivers'
-    results in a race) and follow in the same order, so they only use budget
+    followed by its forward parents. Rows past a later reverse step fan out
+    (e.g. other drivers' results in a race) and follow in the same order, so they only use budget
     the spine leaves over. A row reached by several paths appears once, at its
     first position.
     """

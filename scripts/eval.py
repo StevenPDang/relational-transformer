@@ -11,9 +11,11 @@ directory* -- one ``<dataset>__<task>.csv`` prediction table per task -- that is
 scored with ``relbench.leaderboard.evaluate_task`` (AUROC for clf, NMAE for reg)
 and can be re-validated with ``python -m relbench.leaderboard <out-dir>``.
 
-For rel-f1/driver-top3, ``--raw-dataset`` includes cell preparation, text
-embeddings, and graph construction (``--sampler bfs``) or raw SQL import
-(``--sampler sql``) in the reported runtime, using a fresh ``--prepare-dir``.
+``--raw-dataset`` evaluates a raw RelBench dataset's tasks (all of the
+checkpoint's kind unless ``--tasks`` narrows them) and includes cell
+preparation, text embeddings, and graph construction (``--sampler bfs``) or raw
+SQL import (``--sampler sql``) in the reported runtime, using a fresh
+``--prepare-dir``.
 
 Without ``--out-dir``, each run gets its own timestamped folder grouped by task
 and run type, e.g. ``runs/eval/rel-f1-driver-top3/20261018-183012_raw-sql-metasieve/``
@@ -44,7 +46,9 @@ def main() -> None:
     ap.add_argument("--checkpoint", required=True, help="local path or Hub model repo")
     inputs = ap.add_mutually_exclusive_group(required=True)
     inputs.add_argument("--pre-dir", help="preprocessed RelBench (local or Hub)")
-    inputs.add_argument("--raw-dataset", help="raw rel-f1 directory or Hub spec; includes preparation in runtime")
+    inputs.add_argument("--raw-dataset",
+                        help="raw RelBench directory or Hub spec (e.g. stanford-star/relbench/rel-trial); "
+                             "includes preparation in runtime")
     ap.add_argument("--prepare-dir",
                     help="fresh directory for raw-data preparation (must not exist); "
                          "default: prepare/ inside the run folder")
@@ -74,12 +78,11 @@ def main() -> None:
     ap.add_argument("--local-ctx-size", type=int, default=256)
     ap.add_argument("--bfs-width", type=int, default=32)
     ap.add_argument("--sql-context-db", default=None,
-                    help="opt-in rel-f1/driver-top3 SQL neighborhoods from this DuckDB file "
+                    help="opt-in SQL neighborhoods from this DuckDB file or a folder of <db>.duckdb "
                          "(needs --sql-context-rules); --bfs-width caps labels and reverse steps per seed")
     ap.add_argument("--sql-context-rules", default=None,
-                    help="MetaSieve rule-set JSON from scripts/metasieve.py (e.g. "
-                         "runs/metasieve/rel-f1-driver-top3/latest.json); SQL neighborhoods follow "
-                         "its kept metapaths")
+                    help="MetaSieve rules from scripts/metasieve.py: one task's JSON, or a folder "
+                         "(e.g. runs/metasieve) holding <db>-<task>/latest.json per task")
     ap.add_argument("--num-walks", type=int, default=10_000)
     ap.add_argument("--walk-length", type=int, default=20)
     ap.add_argument("--prefer-latest", action=argparse.BooleanOptionalAction, default=True,
@@ -101,19 +104,23 @@ def main() -> None:
             ap.error("raw SQL builds its own DuckDB database; omit --sql-context-db")
         if args.mode != "simple" or args.recipe != "relbench_eval_test":
             ap.error("raw evaluation currently supports simple mode on the test split")
-        if args.tasks is not None and args.tasks != ["rel-f1/driver-top3"]:
-            ap.error("raw evaluation currently supports only --tasks rel-f1/driver-top3")
+        from rt.raw_eval import raw_dataset_name
+
+        raw_db = raw_dataset_name(args.raw_dataset)
+        if args.tasks is None:
+            args.tasks = [raw_db]
+        elif any(sel.split("/")[0] != raw_db for sel in args.tasks):
+            ap.error(f"--tasks must select tasks of the raw dataset {raw_db}")
         if args.sampler == "sql" and not args.prefer_latest:
             ap.error("raw SQL currently uses recency-ordered seeds; omit --no-prefer-latest")
-        args.tasks = ["rel-f1/driver-top3"]
     elif args.prepare_dir or args.sampler != "bfs":
         ap.error("--prepare-dir and --sampler sql require --raw-dataset; use --sql-context-db with prepared data")
     sql_sampling = bool(args.sql_context_db) or (bool(args.raw_dataset) and args.sampler == "sql")
     if args.sql_context_rules and not sql_sampling:
         ap.error("--sql-context-rules requires --sql-context-db or --raw-dataset with --sampler sql")
     if sql_sampling and not args.sql_context_rules:
-        ap.error("SQL sampling needs MetaSieve rules: run `python -m scripts.metasieve` and pass "
-                 "--sql-context-rules runs/metasieve/rel-f1-driver-top3/latest.json")
+        ap.error("SQL sampling needs MetaSieve rules: run `python -m scripts.metasieve --source <dataset>` "
+                 "and pass --sql-context-rules runs/metasieve")
     if args.out_dir is None:
         from rt.run_dirs import eval_kind, eval_run_dir
 
@@ -164,8 +171,6 @@ def main() -> None:
     if args.raw_dataset:
         from rt.raw_eval import prepare_raw_eval
 
-        if task_type != "clf":
-            ap.error("rel-f1/driver-top3 requires a classification checkpoint")
         args.pre_dir, args.sql_context_db, preparation_timings = prepare_raw_eval(
             args.raw_dataset, args.prepare_dir, sampler=args.sampler,
             embedding_model=config["embedding_model"], d_text=config["d_text"], device=device,
@@ -217,7 +222,14 @@ def main() -> None:
 
     from rt.eval_utils import build_evaluator, run_and_report
 
-    tasks = selected(of_kind(get_tasks(args.recipe, args.pre_dir)))
+    if args.raw_dataset:
+        from rt.tasks import tasks_from_preprocessed
+
+        # The prepared folder holds one dataset: evaluate its own forecast tasks,
+        # not the fixed benchmark list.
+        tasks = selected(of_kind(tasks_from_preprocessed(args.pre_dir, splits=("test",))))
+    else:
+        tasks = selected(of_kind(get_tasks(args.recipe, args.pre_dir)))
     if not tasks:
         raise SystemExit(f"no {task_type} tasks found in {args.pre_dir}")
     ev = build_evaluator(tasks, args.pre_dir, ctx_size=args.ctx_size,

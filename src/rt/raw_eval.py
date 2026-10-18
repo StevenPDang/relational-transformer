@@ -1,10 +1,20 @@
-"""Prepare rel-f1 evaluation from raw tables, with or without a traversal graph."""
+"""Prepare evaluation of a raw RelBench dataset, with or without a traversal graph."""
 
 from __future__ import annotations
 
 import json
 import time
 from pathlib import Path
+
+
+def raw_dataset_name(dataset):
+    """The dataset's manifest name: read locally when possible, else the Hub spec's last part."""
+    import yaml
+
+    manifest = Path(dataset).expanduser() / "manifest.yaml"
+    if manifest.is_file():
+        return yaml.safe_load(manifest.read_text())["name"]
+    return Path(str(dataset).rstrip("/")).name
 
 
 def prepare_raw_eval(dataset, out_dir, *, sampler, embedding_model, d_text, device, batch_size=1024):
@@ -32,17 +42,16 @@ def prepare_raw_eval(dataset, out_dir, *, sampler, embedding_model, d_text, devi
         raw_dir = download_dataset_dir(dataset)
     raw_dir = raw_dir.resolve()
     manifest = yaml.safe_load((raw_dir / "manifest.yaml").read_text())
-    if manifest["name"] != "rel-f1":
-        raise ValueError("Raw evaluation currently supports only rel-f1/driver-top3")
-    if not (raw_dir / "tasks" / "driver-top3" / "manifest.yaml").is_file():
-        raise ValueError("Raw dataset needs the driver-top3 task tables")
+    name = manifest["name"]
+    if not any((raw_dir / "tasks").glob("*/manifest.yaml")):
+        raise ValueError(f"Raw dataset {name} has no task tables to evaluate")
     timings["raw input resolution"] = time.perf_counter() - tick
 
     out_dir.mkdir(parents=True)
     tick = time.perf_counter()
     preprocess(str(raw_dir), str(out_dir), source=str(raw_dir), skip_graph=sampler == "sql")
     timings["cell encoding" if sampler == "sql" else "cell encoding and graph construction"] = time.perf_counter() - tick
-    db_dir = out_dir / "rel-f1"
+    db_dir = out_dir / name
     meta_path = db_dir / "meta.json"
     meta = json.loads(meta_path.read_text())
     meta["raw_dataset_dir"] = str(raw_dir)
@@ -69,7 +78,7 @@ def prepare_raw_eval(dataset, out_dir, *, sampler, embedding_model, d_text, devi
         import duckdb
 
         tick = time.perf_counter()
-        database = out_dir / "rel-f1.duckdb"
+        database = out_dir / f"{name}.duckdb"
         con = duckdb.connect(str(database))
         try:
             for parquet in sorted((raw_dir / "db").glob("*.parquet")):

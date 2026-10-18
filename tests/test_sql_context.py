@@ -6,24 +6,25 @@ from rt.sql_context import historical_seed_orders
 
 # The per-seed query this batched version replaced; kept as the reference order.
 PER_SEED_ORDER_SQL = """
-SELECT node_idx FROM sql_task_labels
-WHERE date < ?
-ORDER BY (driverId = ?) DESC, date DESC, node_idx
+SELECT node_idx FROM labels
+WHERE ts < ?
+ORDER BY (key = ?) DESC, ts DESC, node_idx
 """
 
 
 def test_batched_seed_order_matches_per_seed_queries():
     con = duckdb.connect()
-    labels = pd.DataFrame({
-        "node_idx": [501, 502, 503, 504, 505, 506],
-        "driverId": [42, 42, 7, 7, 42, 9],
-        "date": pd.to_datetime(["2019-01-01", "2020-01-02", "2019-06-01",
-                                "2020-01-02", "2020-01-03", "2018-01-01"]),
+    seeds = pd.DataFrame({
+        "seed": [501, 502, 503, 504, 505, 506],
+        "key": [42, 42, 7, 7, 42, 9],
+        "ts": pd.to_datetime(["2019-01-01", "2020-01-02", "2019-06-01",
+                              "2020-01-02", "2020-01-03", "2018-01-01"]),
     })
-    con.register("sql_task_labels", labels)
-    seeds = pd.DataFrame({"seed": labels["node_idx"], "key": labels["driverId"], "ts": labels["date"]})
     try:
-        orders = historical_seed_orders(con, seeds)
+        orders = historical_seed_orders(seeds, limit=len(seeds))
+        assert historical_seed_orders(seeds, limit=2)[505] == orders[505][:2]
+        assert historical_seed_orders(seeds, limit=1) == {s: o[:1] for s, o in orders.items()}
+        con.register("labels", seeds.rename(columns={"seed": "node_idx"}))
         for seed, key, ts in seeds.itertuples(index=False, name=None):
             expected = [n for n, in con.execute(PER_SEED_ORDER_SQL, [ts.to_pydatetime(), key]).fetchall()]
             assert orders[seed] == expected

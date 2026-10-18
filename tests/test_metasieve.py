@@ -1,10 +1,12 @@
+import json
+
 import duckdb
 import numpy as np
 import pandas as pd
 import pytest
 
 from rt import metasieve
-from rt.sql_context import metasieve_context_nodes
+from rt.sql_context import historical_seed_orders, metasieve_context_nodes
 
 # drivers <- results -> races -> circuits; results -> constructors
 SCHEMA = {
@@ -17,6 +19,8 @@ SCHEMA = {
 }
 OFFSETS = {"drivers": 100, "results": 200, "races": 300, "constructors": 400, "circuits": 450}
 INFO = {f"{t}:Db": {"node_idx_offset": o} for t, o in OFFSETS.items()}
+TASK = metasieve.task_info(SCHEMA, db="rel-f1", name="driver-top3", entity_table="drivers",
+                           entity_col="driverId", time_col="date", target_col="qualifying", task_type="clf")
 
 RES = ("<-results.driverId",)
 
@@ -144,17 +148,94 @@ def test_fan_out_rows_follow_the_whole_spine(con):
     assert nodes == [(201, 2), (301, 3), (203, 2), (302, 3), (200, 2), (300, 3), (204, 4)]
 
 
-def test_rel_f1_contexts_put_driver_and_labels_before_metapath_rows(con):
-    labels = pd.DataFrame({"node_idx": [501, 502, 503], "driverId": [42, 42, 7],
-                           "date": pd.to_datetime(["2019-06-01", "2020-01-02", "2019-06-01"])})
-    con.register("sql_task_labels", labels)
+def test_contexts_put_entity_and_labels_before_metapath_rows(con):
     paths = by_name(metasieve.enumerate_metapaths(SCHEMA, "drivers", 2))
-    rules = {"entity_table": "drivers", "schema": SCHEMA, "params": {"strict": False}, "paths": [
+    rules = {"task": TASK, "schema": SCHEMA, "params": {"strict": False}, "paths": [
         {"path": [list(st) for st in paths[name]], "keep": keep} for name, keep in [
             ("<-results.driverId", True), ("<-results.driverId ->races[raceId]", False),
             ("<-results.driverId ->constructors[constructorId]", True)]]}
-    s = seeds((502, 42, "2020-01-02"), (503, 7, "2019-06-01"))
+    # Task rows double as the label table: 501 is an earlier label of driver 42.
+    s = seeds((501, 42, "2019-06-01"), (502, 42, "2020-01-02"), (503, 7, "2019-06-01"))
     ctx = metasieve_context_nodes(con, INFO, rules, s, width=4)
     # Driver, earlier label 501 (not its own 502), then results with constructors; no races.
     assert ctx[502] == [(100, 1), (501, 2), (203, 2), (401, 3), (200, 2), (400, 3)]
-    assert ctx[503] == [(101, 1)]  # nothing of driver 7 happened before 2019-06-01
+    assert ctx[501] == [(100, 1)]  # driver 42 had no results before 2019-06-01
+    assert ctx[503] == [(101, 1)]
+    # Chunking frontiers changes nothing.
+    assert metasieve_context_nodes(con, INFO, rules, s, width=4, chunk=1) == ctx
+
+
+def test_any_schema_entity_key_names_and_string_keys():
+    """Nothing assumes rel-f1: entity key named differently in the task, string keys,
+    untimestamped parents, and a task table that is not keyed like the entity."""
+    con = duckdb.connect()
+    con.execute("CREATE TABLE users(user_id VARCHAR, country VARCHAR)")
+    con.execute("INSERT INTO users VALUES ('u1','fr'), ('u2','de')")
+    con.execute("CREATE TABLE items(item_id VARCHAR, brand VARCHAR)")
+    con.execute("INSERT INTO items VALUES ('i1','x'), ('i2','y')")
+    con.execute("CREATE TABLE reviews(review_id BIGINT, uid VARCHAR, item VARCHAR, ts TIMESTAMP)")
+    con.execute("INSERT INTO reviews VALUES (1,'u1','i1','2020-01-01'),(2,'u1','i2','2020-02-01'),"
+                "(3,'u2','i1','2020-03-01')")
+    schema = {
+        "users": {"pkey": "user_id", "time": None, "fkeys": {}},
+        "items": {"pkey": "item_id", "time": None, "fkeys": {}},
+        "reviews": {"pkey": "review_id", "time": "ts", "fkeys": {"uid": "users", "item": "items"}},
+    }
+    info = {f"{t}:Db": {"node_idx_offset": o} for t, o in [("users", 10), ("items", 20), ("reviews", 30)]}
+    task = metasieve.task_info(schema, db="shop", name="user-churn", entity_table="users",
+                               entity_col="customer", time_col="when", target_col="churn", task_type="clf")
+    assert task["entity_pkey"] == "user_id"
+    rules = metasieve.keep_all_rules(schema, task, hops=2)
+    s = pd.DataFrame({"seed": [900, 901, 902], "key": ["u1", "u1", "u2"],
+                      "ts": pd.to_datetime(["2020-01-15", "2020-03-01", "2020-03-01"])})
+    try:
+        ctx = metasieve_context_nodes(con, info, rules, s, width=4)
+        orders = historical_seed_orders(s)
+    finally:
+        con.close()
+    # u1 at 2020-03-01: user row, earlier label 900, both reviews (newest first) with items.
+    assert ctx[901][:2] == [(10, 1), (900, 2)]
+    assert [n for n, _ in ctx[901] if 30 <= n < 40] == [31, 30]
+    assert {21, 20} <= {n for n, _ in ctx[901]}
+    assert ctx[902][0] == (11, 1) and 30 + 2 in {n for n, _ in ctx[902]}
+    assert orders == {900: [], 901: [900], 902: [900]}
+
+
+def test_rules_resolve_per_task_and_reject_other_tasks(tmp_path):
+    from rt.sql_context import load_metasieve_rules, resolve_duckdb
+
+    rules = metasieve.keep_all_rules(SCHEMA, TASK, hops=1)
+    folder = tmp_path / "rel-f1-driver-top3"
+    folder.mkdir()
+    (folder / "latest.json").write_text(json.dumps(rules))
+    assert load_metasieve_rules(tmp_path, "rel-f1", "driver-top3")["task"] == TASK
+    assert load_metasieve_rules(folder / "latest.json", "rel-f1", "driver-top3")["task"] == TASK
+    with pytest.raises(ValueError, match="not rel-f1/driver-dnf"):
+        load_metasieve_rules(folder / "latest.json", "rel-f1", "driver-dnf")
+    with pytest.raises(FileNotFoundError, match="scripts.metasieve"):
+        load_metasieve_rules(tmp_path, "rel-trial", "study-outcome")
+    old = dict(rules)
+    del old["task"]
+    (tmp_path / "old.json").write_text(json.dumps(old))
+    with pytest.raises(ValueError, match="older format"):
+        load_metasieve_rules(tmp_path / "old.json", "rel-f1", "driver-top3")
+    assert resolve_duckdb(tmp_path, "rel-trial") == str(tmp_path / "rel-trial.duckdb")
+    assert resolve_duckdb(tmp_path / "f1.duckdb", "rel-trial") == str(tmp_path / "f1.duckdb")
+
+
+def test_path_counts_chunking_is_exact(con):
+    paths = metasieve.enumerate_metapaths(SCHEMA, "drivers", 3)
+    s = seeds((0, 42, "2020-01-02"), (1, 7, "2020-01-02"), (2, 42, "2020-01-03"))
+    whole = metasieve.path_counts(con, SCHEMA, "drivers", s, paths)
+    pd.testing.assert_frame_equal(metasieve.path_counts(con, SCHEMA, "drivers", s, paths, chunk=2), whole)
+
+
+def test_cap_seeds_keeps_each_label_and_order():
+    from scripts.metasieve import cap_seeds
+
+    train = pd.DataFrame({"y": [0] * 90 + [1] * 10, "x": range(100)})
+    capped = cap_seeds(train, "y", "clf", 20)
+    assert capped["y"].value_counts().to_dict() == {0: 10, 1: 10}
+    assert capped.index.is_monotonic_increasing
+    assert len(cap_seeds(train, "y", "reg", 30)) == 30
+    assert cap_seeds(train, "y", "clf", None) is train

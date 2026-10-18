@@ -140,11 +140,11 @@ class RustlerDataset:
         sql_context_rules: str | None = None,
     ):
         if (sql_context_db is None) != (sql_context_rules is None):
-            raise ValueError("SQL context sampling needs both a DuckDB file and MetaSieve rules")
-        if sql_context_db is not None and (
-            not tasks or any(t.db_name != "rel-f1" or t.table_name != "driver-top3" for t in tasks)
-        ):
-            raise ValueError("SQL context sampling currently supports only rel-f1/driver-top3")
+            raise ValueError("SQL context sampling needs both a DuckDB database and MetaSieve rules")
+        if sql_context_db is not None and len({(t.db_name, t.table_name) for t in tasks}) != 1:
+            # Rules and seed neighborhoods are selected for one task table.
+            raise ValueError("SQL context sampling builds one task per dataset; got "
+                             f"{sorted({f'{t.db_name}/{t.table_name}' for t in tasks})}")
         # `pre_dir` may be a local path or a HuggingFace repo spec; resolve to a
         # local root, downloading only the files needed for these databases.
         pre_dir = resolve_pre_dir(pre_dir, [t.db_name for t in tasks], embedding_model)
@@ -257,28 +257,27 @@ class RustlerDataset:
         self.num_items = self.sampler.num_items
 
         if sql_context_db is not None:
-            from rt.sql_context import load_metasieve_rules
+            from rt.sql_context import load_contexts, load_metasieve_rules, load_raw_contexts
 
-            rules = load_metasieve_rules(sql_context_rules)
+            db_name, task_name = tasks[0].db_name, tasks[0].table_name
+            rules = load_metasieve_rules(sql_context_rules, db_name, task_name)
             if graph_free:
-                from rt.sql_context import load_raw_rel_f1_contexts
-
-                contexts, orders = load_raw_rel_f1_contexts(
-                    pre_dir, sql_context_db, max(bfs_widths), rules, timings=setup_timings
+                contexts, orders = load_raw_contexts(
+                    pre_dir, sql_context_db, db_name, task_name, max(bfs_widths), rules,
+                    timings=setup_timings,
                 )
                 tick = time.perf_counter()
-                self.sampler.set_sql_contexts_py("rel-f1", contexts)
+                self.sampler.set_sql_contexts_py(db_name, contexts)
                 if setup_timings is not None:
                     setup_timings["Rust context transfer and validation"] = time.perf_counter() - tick
                 tick = time.perf_counter()
-                self.sampler.set_sql_seed_order_py("rel-f1", orders)
+                self.sampler.set_sql_seed_order_py(db_name, orders)
                 if setup_timings is not None:
                     setup_timings["Rust seed order transfer and validation"] = time.perf_counter() - tick
             else:
-                from rt.sql_context import load_rel_f1_contexts
-
-                contexts = load_rel_f1_contexts(pre_dir, sql_context_db, max(bfs_widths), rules)
-                self.sampler.set_sql_contexts_py("rel-f1", contexts)
+                contexts = load_contexts(pre_dir, sql_context_db, db_name, task_name,
+                                         max(bfs_widths), rules)
+                self.sampler.set_sql_contexts_py(db_name, contexts)
 
         self.d_text = d_text
         self.bool_as_num = bool_as_num
