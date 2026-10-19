@@ -280,6 +280,73 @@ def historical_seed_orders(seeds, limit=SEED_ORDER_LIMIT, chunk=None):
                       np.concatenate(out_cands))
 
 
+# Rows reached by more seeds than this carry almost no proximity signal (their
+# weight is 1/df) and would make the pairwise work grow with df squared.
+PATH_MAX_DF = 2000
+
+
+def path_seed_orders(contexts, seeds, table_info, limit=SEED_ORDER_LIMIT, max_df=PATH_MAX_DF, chunk=2048):
+    """Rank historical seeds by the database rows their neighborhoods share.
+
+    A deterministic stand-in for random-walk proximity: two task rows are close
+    when their MetaSieve neighborhoods reach the same rows (the same entity,
+    sponsor, facility, ...). Each shared row adds ``1 / df``, where ``df`` is how
+    many seeds' neighborhoods reach it, as a walk's probability splits at a
+    hub. Candidates are strictly earlier task rows, by score, then recency,
+    then node index; any remaining slots up to ``limit`` are filled in
+    :func:`historical_seed_orders` order. Returns :class:`SeedOrders`.
+    """
+    import numpy as np
+    import pandas as pd
+    from scipy import sparse
+
+    fallback = historical_seed_orders(seeds, limit=limit)
+    seeds = seeds.sort_values("seed", kind="stable")
+    node = seeds["seed"].to_numpy(dtype="int64")
+    n = len(node)
+    if n == 0 or not np.array_equal(contexts.seeds, node):
+        if n == 0:
+            return fallback
+        raise ValueError("Contexts and seeds must cover the same task rows")
+    ts = pd.to_datetime(seeds["ts"]).to_numpy("datetime64[ns]").astype("int64")
+
+    # Seed x DB-row incidence of every neighborhood, deduplicated.
+    db = sorted((v["node_idx_offset"], v["node_idx_offset"] + v["num_nodes"])
+                for k, v in table_info.items() if k.endswith(":Db"))
+    nodes = contexts.nodes.astype("int64")
+    is_db = np.zeros(len(nodes), dtype=bool)
+    for lo, hi in db:
+        is_db |= (nodes >= lo) & (nodes < hi)
+    row = np.repeat(np.arange(n), np.diff(contexts.offsets))[is_db]
+    col, uniq = pd.factorize(nodes[is_db])
+    a = sparse.csr_matrix((np.ones(len(row), dtype="float32"), (row, col)), shape=(n, len(uniq)))
+    a.data[:] = 1.0  # duplicates summed on construction
+    df = np.asarray(a.sum(axis=0)).ravel()
+    keep = (df >= 2) & (df <= max_df)
+    a = a[:, np.flatnonzero(keep)].tocsr()
+    weighted = (a @ sparse.diags(1.0 / df[keep])).tocsr()
+    at = a.T.tocsr()
+
+    out_counts, out_cands = [], []
+    for lo in range(0, n, chunk):
+        scores = (weighted[lo:lo + chunk] @ at).tocsr()
+        for i in range(scores.shape[0]):
+            seed_i = lo + i
+            idx = scores.indices[scores.indptr[i]:scores.indptr[i + 1]]
+            val = scores.data[scores.indptr[i]:scores.indptr[i + 1]]
+            earlier = ts[idx] < ts[seed_i]
+            idx, val = idx[earlier], val[earlier]
+            ranked = node[idx[np.lexsort((node[idx], -ts[idx], -val))]][:limit]
+            if len(ranked) < limit:
+                rest = np.asarray(fallback[node[seed_i]], dtype="int64")
+                rest = rest[~np.isin(rest, ranked)][:limit - len(ranked)]
+                ranked = np.concatenate([ranked, rest])
+            out_counts.append(len(ranked))
+            out_cands.append(ranked.astype("int32"))
+    return SeedOrders(node.astype("int32"), np.append(0, np.cumsum(out_counts)).astype("int64"),
+                      np.concatenate(out_cands) if out_cands else np.zeros(0, dtype="int32"))
+
+
 def _seed_frame(splits):
     """All task rows as one (seed, key, ts) frame."""
     import pandas as pd
@@ -401,7 +468,9 @@ def load_raw_contexts(pre_dir, database, db_name, task_name, width, rules, timin
         if timings is not None:
             timings["SQL neighborhood queries and assembly"] = time.perf_counter() - tick
         tick = time.perf_counter()
-        orders = historical_seed_orders(seeds)
+        # Recency alone retrieves unrelated rows when entities do not recur
+        # (rel-trial study-outcome scored chance); rank by shared neighborhoods.
+        orders = path_seed_orders(contexts, seeds, info)
         if timings is not None:
             timings["SQL historical seed queries"] = time.perf_counter() - tick
         return contexts, orders

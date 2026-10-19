@@ -54,9 +54,16 @@ Omit `--sql-context-db` and `--sql-context-rules` for the matching BFS run.
 
 **Raw:** prepares cells, embeddings and a DuckDB import from raw Parquet inside
 the timed run, with no traversal graph, then evaluates the dataset's tasks of
-the checkpoint's kind (`--tasks` narrows them). Historical seeds are ordered
-without random walks: strictly earlier task rows, same entity first, then most
-recent, so `--num-walks` and `--walk-length` do not apply.
+the checkpoint's kind (`--tasks` narrows them). Historical seeds are ranked
+without random walks, so `--num-walks` and `--walk-length` do not apply: among
+strictly earlier task rows, those whose neighborhoods share the most database
+rows with the seed's come first (each shared row weighted by 1/the number of
+neighborhoods reaching it, as a walk splits at a hub; rows in more than 2,000
+are ignored), then the rest by recency. Ranking by recency alone scored chance
+on rel-trial study-outcome, where studies do not recur. `scripts/seed_ranking_check.py`
+compares both rankings without a model: the mean label of each validation and
+test row's top 32 candidates scores 0.82/0.87 AUROC for driver-top3 with path
+ranking against 0.71/0.83 by recency.
 
 ```bash
 pixi run --environment cuda124 eval \

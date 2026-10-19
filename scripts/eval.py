@@ -54,7 +54,7 @@ def main() -> None:
                          "default: prepare/ inside the run folder")
     ap.add_argument("--sampler", choices=["bfs", "sql"], default="bfs",
                     help="raw-data sampler: bfs builds a graph; sql builds MetaSieve neighborhoods "
-                         "(needs --sql-context-rules) and orders seeds in SQL instead of random walks")
+                         "(needs --sql-context-rules) and ranks seeds by shared neighborhood rows instead of random walks")
     ap.add_argument("--embedding-batch-size", type=int, default=1024,
                     help="text-embedding batch size for raw-data preparation")
     ap.add_argument("--mode", default="simple", choices=["simple", "ensemble"],

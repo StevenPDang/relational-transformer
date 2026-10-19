@@ -141,3 +141,31 @@ def test_node_text_ids_cover_only_the_requested_nodes(synthetic_dataset, tmp_pat
     assert set(one_values) <= set(values) and set(one_names) <= set(names)
     with pytest.raises(IndexError, match='out of range'):
         node_text_ids(str(db), [total + 5])
+
+
+def test_path_seed_orders_rank_shared_rows_first_and_respect_time():
+    import numpy as np
+
+    from rt.sql_context import SqlContexts, path_seed_orders
+
+    info = {'rows:Db': {'node_idx_offset': 0, 'num_nodes': 100}, 'task:Train': {'node_idx_offset': 500, 'num_nodes': 6}}
+    seeds = pd.DataFrame({
+        'seed': [500, 501, 502, 503, 504, 505],
+        'key': [1, 2, 3, 4, 5, 6],
+        'ts': pd.to_datetime(['2020-01-01', '2020-01-02', '2020-01-03', '2020-01-04', '2020-01-05', '2020-01-06']),
+    })
+    # 505 shares rows 10 and 11 with 501, row 12 with 503; 504 shares nothing with it.
+    # Row 50 is in every neighborhood, a hub; task-row nodes (>= 500) are ignored.
+    hoods = {500: [50], 501: [10, 11, 50], 502: [50, 20], 503: [12, 50], 504: [30, 50, 505], 505: [10, 11, 12, 50]}
+    rows = [(s, n) for s in sorted(hoods) for n in hoods[s]]
+    contexts = SqlContexts.from_rows(sorted(hoods), [s for s, _ in rows], [n for _, n in rows], [2] * len(rows))
+    orders = path_seed_orders(contexts, seeds, info, limit=10)
+    # Shared rows first (two shared rows beat one), then recency for the rest.
+    assert orders[505] == [501, 503, 504, 502, 500]
+    assert orders[500] == []  # nothing is earlier
+    assert all(c < s for s in hoods for c in orders[s])  # earlier rows only (same order as time here)
+    # A hub cap that drops every shared row falls back to recency entirely.
+    assert path_seed_orders(contexts, seeds, info, limit=10, max_df=1)[505] == [504, 503, 502, 501, 500]
+    assert path_seed_orders(contexts, seeds, info, limit=2)[505] == [501, 503]
+    with pytest.raises(ValueError, match='same task rows'):
+        path_seed_orders(contexts, seeds.iloc[:5], info)
