@@ -24,7 +24,7 @@ def slug(text: str) -> str:
 def eval_kind(*, raw: bool, sampler: str, sql_context_db, sql_context_rules, mode: str) -> str:
     """Short run type, e.g. raw-bfs, prepared-sql-metasieve, prepared-bfs-ensemble."""
     kind = sampler if raw else ("sql" if sql_context_db else "bfs")
-    if sql_context_rules:
+    if kind == "sql":  # SQL sampling always follows MetaSieve rules
         kind += "-metasieve"
     kind = f"{'raw' if raw else 'prepared'}-{kind}"
     return kind if mode == "simple" else f"{kind}-{mode}"

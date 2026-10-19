@@ -9,7 +9,7 @@ def test_eval_kind_names_mode_and_sampler():
     kind = lambda **kw: eval_kind(**{"raw": False, "sampler": "bfs", "sql_context_db": None,
                                     "sql_context_rules": None, "mode": "simple", **kw})
     assert kind() == "prepared-bfs"
-    assert kind(sql_context_db="f1.duckdb") == "prepared-sql"
+    assert kind(sql_context_db="f1.duckdb") == "prepared-sql-metasieve"
     assert kind(sql_context_db="f1.duckdb", sql_context_rules="r.json") == "prepared-sql-metasieve"
     assert kind(raw=True) == "raw-bfs"
     assert kind(raw=True, sampler="sql", sql_context_rules="r.json") == "raw-sql-metasieve"

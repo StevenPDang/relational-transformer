@@ -47,6 +47,40 @@ def task_info(schema, *, db, name, entity_table, entity_col, time_col, target_co
             "entity_pkey": pkey, "time_col": time_col, "target_col": target_col, "task_type": task_type}
 
 
+def manifest_schema(manifest):
+    """Schema dict from a raw RelBench ``manifest.yaml`` (no tables loaded)."""
+    return {
+        name: {"pkey": spec.get("pkey"), "time": spec.get("time_col"), "fkeys": dict(spec.get("fkeys") or {})}
+        for name, spec in manifest["tables"].items()
+    }
+
+
+def manifest_task_info(schema, db, task_manifest):
+    """:func:`task_info` from a raw RelBench task ``manifest.yaml``."""
+    task_type = {"binary_classification": "clf", "regression": "reg"}.get(task_manifest.get("task_type"))
+    if task_type is None:
+        raise ValueError(f"{task_manifest.get('name')} is not a node-level clf/reg task")
+    return task_info(schema, db=db, name=task_manifest["name"], entity_table=task_manifest["entity_table"],
+                     entity_col=task_manifest["entity_col"], time_col=task_manifest["time_col"],
+                     target_col=task_manifest["target_col"], task_type=task_type)
+
+
+def cap_seeds(train, target_col, task_type, max_seeds, seed=0):
+    """At most ``max_seeds`` training rows; classification keeps every label's share.
+
+    Capping per label keeps rare labels from being swamped by the majority
+    when scoring (paper section 7.1). Row order is preserved.
+    """
+    if max_seeds is None or len(train) <= max_seeds:
+        return train
+    if task_type == "reg":
+        return train.sample(n=max_seeds, random_state=seed).sort_index()
+    groups = train.groupby(target_col)
+    per_label = max(1, max_seeds // groups.ngroups)
+    keep = [i for _, g in groups for i in g.sample(n=min(len(g), per_label), random_state=seed).index]
+    return train.loc[sorted(keep)]
+
+
 def relbench_task_info(schema, db, name, task):
     """:func:`task_info` from a ``relbench`` task object (which does not know its name)."""
     task_type = "reg" if "regression" in str(task.task_type).lower() else "clf"

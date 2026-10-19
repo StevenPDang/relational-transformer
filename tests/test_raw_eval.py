@@ -151,7 +151,7 @@ def test_raw_sql_needs_no_traversal_graph_and_preserves_model_encoding(raw_f1, z
                                              orders.candidates[orders.offsets[1]:])
 
 
-@pytest.mark.parametrize("sampler", ["sql", "bfs"])
+@pytest.mark.parametrize("sampler", ["sql", "sql-auto", "bfs"])
 def test_raw_eval_cli_reports_full_split_and_preparation_runtime(raw_f1, zero_embedder, tmp_path, monkeypatch, sampler):
     import torch
     import scripts.eval as cli
@@ -172,10 +172,11 @@ def test_raw_eval_cli_reports_full_split_and_preparation_runtime(raw_f1, zero_em
     monkeypatch.setattr(cli, "load_rt_model", lambda *a, **kw: (MockModel(), {
         "task_type": "clf", "embedding_model": "test", "d_text": 8}))
     out = tmp_path / f"report-{sampler}"
+    # sql passes rules; sql-auto selects them inside the timed run.
     rules = ["--sql-context-rules", keep_all_rules_file(raw_f1, tmp_path / "rules.json")[1]] \
         if sampler == "sql" else []
     monkeypatch.setattr(sys, "argv", ["eval", "--checkpoint", "mock", "--raw-dataset", str(raw_f1),
-        "--prepare-dir", str(tmp_path / f"prep-{sampler}"), "--sampler", sampler,
+        "--prepare-dir", str(tmp_path / f"prep-{sampler}"), "--sampler", sampler.removesuffix("-auto"),
         "--out-dir", str(out), "--ctx-size", "256", "--local-ctx-size", "128",
         "--tokens-per-gpu", "512", "--num-workers", "0", *rules])
     cli.main()
@@ -183,12 +184,19 @@ def test_raw_eval_cli_reports_full_split_and_preparation_runtime(raw_f1, zero_em
     assert len(predictions) == 2
     assert set(predictions.driverId) == {0, 1}
     runtime = json.loads((out / "runtime.json").read_text())
-    assert runtime["sampler"] == ("sql+metasieve" if sampler == "sql" else sampler)
+    assert runtime["sampler"] == ("bfs" if sampler == "bfs" else "sql+metasieve")
     assert "raw data preparation" in runtime["seconds"]
     assert runtime["seconds"]["total"] >= sum(
         value for name, value in runtime["seconds"].items() if name != "total")
     assert "text embeddings" in runtime["preparation_seconds"]
-    if sampler == "sql":
+    if sampler != "bfs":
+        prep = tmp_path / f"prep-{sampler}"
+        assert {"MetaSieve selection", "SQL contexts and seed orders", "context text ids"} <= set(
+            runtime["preparation_seconds"])
+        assert (prep / "rel-f1" / "sql_contexts" / "driver-top3" / "contexts.npz").is_file()
+        assert (prep / "metasieve" / "rel-f1-driver-top3" / "latest.json").is_file() == (sampler == "sql-auto")
+        embedded = json.loads((prep / "rel-f1" / "meta.json").read_text())["text_embeddings"]["test"]
+        assert 0 < embedded["embedded_texts"] <= embedded["texts"]
         setup = runtime["setup_seconds"]
         assert set(setup) == {
             "SQL neighborhood queries and assembly", "SQL historical seed queries",
@@ -199,3 +207,27 @@ def test_raw_eval_cli_reports_full_split_and_preparation_runtime(raw_f1, zero_em
         assert sum(setup.values()) == pytest.approx(runtime["seconds"]["task and evaluator setup"], abs=0.01)
     else:
         assert runtime["setup_seconds"] == {}
+
+
+def test_write_embeddings_fills_only_requested_rows(tmp_path):
+    from ml_dtypes import bfloat16
+
+    from rt.raw_eval import write_embeddings
+
+    seen = []
+
+    def embedder(texts, device):
+        seen.append(list(texts))
+        return np.array([[float(len(t))] * 4 for t in texts], dtype=bfloat16)
+
+    texts = ["a", "bb", "ccc", "dddd", "eeeee"]
+    path = tmp_path / "emb.bin"
+    write_embeddings(path, texts, np.array([1, 3]), embedder, 4, "cpu")
+    assert seen == [["bb", "dddd"]]  # only the requested texts are embedded
+    table = np.fromfile(path, dtype=bfloat16).reshape(5, 4).astype("float32")
+    assert table[:, 0].tolist() == [0, 2, 0, 4, 0]  # other rows read as zeros
+    full = tmp_path / "full.bin"
+    write_embeddings(full, texts, None, embedder, 4, "cpu")
+    assert np.fromfile(full, dtype=bfloat16).reshape(5, 4).astype("float32")[:, 0].tolist() == [1, 2, 3, 4, 5]
+    with pytest.raises(ValueError, match="dimension"):
+        write_embeddings(tmp_path / "bad.bin", texts, np.array([0]), embedder, 8, "cpu")

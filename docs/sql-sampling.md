@@ -52,9 +52,14 @@ pixi run --environment cuda124 eval \
 
 Omit `--sql-context-db` and `--sql-context-rules` for the matching BFS run.
 
-**Raw:** prepares cells, embeddings and a DuckDB import from raw Parquet inside
-the timed run, with no traversal graph, then evaluates the dataset's tasks of
-the checkpoint's kind (`--tasks` narrows them). Historical seeds are ranked
+**Raw:** a one-shot run from raw Parquet, everything inside the timed run and
+no traversal graph: encode every cell, import the tables into DuckDB, select
+MetaSieve rules for each task (unless `--sql-context-rules` gives them), build
+every task row's neighborhood and seed order, then embed **only the text the
+test split's contexts can reach** (test rows, their candidate seeds and those
+rows' neighborhoods); every other row of the embedding table stays zero and is
+never looked up. It evaluates the dataset's tasks of the checkpoint's kind
+(`--tasks` narrows them). Historical seeds are ranked
 without random walks, so `--num-walks` and `--walk-length` do not apply: among
 strictly earlier task rows, those whose neighborhoods share the most database
 rows with the seed's come first (each shared row weighted by 1/the number of
@@ -118,9 +123,18 @@ user-churn needs roughly 8 GB for neighborhoods and 21 GB for seed orders, held 
 
 ## One-shot coverage
 
-For one cold raw run, preparation dominates: on rel-trial study-outcome, text
-embeddings take ~375-385 s of a ~500 s run with either sampler. SQL contexts
-only reach the rows their kept metapaths select, so after a raw SQL run,
+For one cold raw run, embedding every text dominates: on rel-trial
+study-outcome it took ~375-385 s of a ~500 s run with either sampler. Raw SQL
+now embeds only the text its contexts can reach; on rel-trial that is 0.7%
+(study-outcome), 1.8% (study-adverse) and 22.8% (site-success) of the text
+characters. Contexts-only embedding is lossless in coverage: over all 2,188
+rel-f1 test items of three tasks, model inputs match a full-embedding run in
+every tensor, with no text row missing; text embeddings differ by at most one
+bf16 rounding step, because sentence-transformers batches a subset differently.
+`preparation_seconds` reports the extra stages: MetaSieve selection, SQL
+contexts and seed orders, and context text ids.
+
+To see how much a run's contexts touch,
 
 ```bash
 pixi run --environment cuda124 python -m scripts.context_coverage --run runs/eval/<tasks>/<timestamp>_raw-sql-metasieve

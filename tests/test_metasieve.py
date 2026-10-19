@@ -236,11 +236,9 @@ def test_path_counts_chunking_is_exact(con):
 
 
 def test_cap_seeds_keeps_each_label_and_order():
-    from scripts.metasieve import cap_seeds
-
     train = pd.DataFrame({"y": [0] * 90 + [1] * 10, "x": range(100)})
-    capped = cap_seeds(train, "y", "clf", 20)
+    capped = metasieve.cap_seeds(train, "y", "clf", 20)
     assert capped["y"].value_counts().to_dict() == {0: 10, 1: 10}
     assert capped.index.is_monotonic_increasing
-    assert len(cap_seeds(train, "y", "reg", 30)) == 30
-    assert cap_seeds(train, "y", "clf", None) is train
+    assert len(metasieve.cap_seeds(train, "y", "reg", 30)) == 30
+    assert metasieve.cap_seeds(train, "y", "clf", None) is train

@@ -82,7 +82,8 @@ def main() -> None:
                          "(needs --sql-context-rules); --bfs-width caps labels and reverse steps per seed")
     ap.add_argument("--sql-context-rules", default=None,
                     help="MetaSieve rules from scripts/metasieve.py: one task's JSON, or a folder "
-                         "(e.g. runs/metasieve) holding <db>-<task>/latest.json per task")
+                         "(e.g. runs/metasieve) holding <db>-<task>/latest.json per task; raw SQL runs "
+                         "without it select rules inside the timed run")
     ap.add_argument("--num-walks", type=int, default=10_000)
     ap.add_argument("--walk-length", type=int, default=20)
     ap.add_argument("--prefer-latest", action=argparse.BooleanOptionalAction, default=True,
@@ -118,9 +119,9 @@ def main() -> None:
     sql_sampling = bool(args.sql_context_db) or (bool(args.raw_dataset) and args.sampler == "sql")
     if args.sql_context_rules and not sql_sampling:
         ap.error("--sql-context-rules requires --sql-context-db or --raw-dataset with --sampler sql")
-    if sql_sampling and not args.sql_context_rules:
-        ap.error("SQL sampling needs MetaSieve rules: run `python -m scripts.metasieve --source <dataset>` "
-                 "and pass --sql-context-rules runs/metasieve")
+    if args.sql_context_db and not args.sql_context_rules:
+        ap.error("SQL sampling on prepared data needs MetaSieve rules: run `python -m scripts.metasieve "
+                 "--source <dataset>` and pass --sql-context-rules runs/metasieve")
     if args.out_dir is None:
         from rt.run_dirs import eval_kind, eval_run_dir
 
@@ -171,11 +172,17 @@ def main() -> None:
     if args.raw_dataset:
         from rt.raw_eval import prepare_raw_eval
 
+        # SQL selects rules (unless given) and builds every neighborhood before
+        # embedding, so only the text the test split's contexts reach is embedded.
+        sql_plan = dict(task_type=task_type, selectors=args.tasks, width=args.bfs_width,
+                        rules=args.sql_context_rules) if args.sampler == "sql" else None
         args.pre_dir, args.sql_context_db, preparation_timings = prepare_raw_eval(
             args.raw_dataset, args.prepare_dir, sampler=args.sampler,
             embedding_model=config["embedding_model"], d_text=config["d_text"], device=device,
-            batch_size=args.embedding_batch_size,
+            batch_size=args.embedding_batch_size, sql=sql_plan,
         )
+        if args.sampler == "sql" and not args.sql_context_rules:
+            args.sql_context_rules = str(Path(args.pre_dir) / "metasieve")
         for label, seconds in preparation_timings.items():
             print(f"runtime | preparation / {label}: {seconds:.2f}s", flush=True)
         setup_started_at = report_runtime("raw data preparation", setup_started_at)

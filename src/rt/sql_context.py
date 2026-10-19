@@ -347,6 +347,74 @@ def path_seed_orders(contexts, seeds, table_info, limit=SEED_ORDER_LIMIT, max_df
                       np.concatenate(out_cands) if out_cands else np.zeros(0, dtype="int32"))
 
 
+def reachable_nodes(contexts, orders, eval_seeds):
+    """Every node evaluating ``eval_seeds`` can put in a context.
+
+    The evaluated rows, their candidate historical seeds, and every listed row
+    of those seeds' neighborhoods (with the seeds themselves, if ``contexts``
+    came from :meth:`SqlContexts.with_seeds`). Rust adds no other rows in SQL
+    mode, so text outside these nodes is never looked up.
+    """
+    import numpy as np
+
+    eval_seeds = np.asarray(eval_seeds, dtype="int64")
+    pos = np.searchsorted(orders.seeds, eval_seeds)
+    cands = [orders.candidates[orders.offsets[i]:orders.offsets[i + 1]] for i in pos]
+    seeds = np.union1d(eval_seeds, np.concatenate(cands) if cands else np.zeros(0, dtype="int64"))
+    cpos = np.searchsorted(contexts.seeds, seeds)
+    parts = [contexts.nodes[contexts.offsets[i]:contexts.offsets[i + 1]] for i in cpos]
+    return np.unique(np.concatenate(parts + [seeds.astype(contexts.nodes.dtype)]))
+
+
+def _rules_key(rules, width):
+    """Identifies what a saved neighborhood was built from."""
+    import hashlib
+
+    kept = [row["path"] for row in rules["paths"] if row["keep"]]
+    blob = json.dumps({"kept": kept, "width": int(width), "task": rules["task"],
+                       "strict": rules["params"].get("strict", False)}, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def save_contexts(db_dir, task_name, rules, width, contexts, orders):
+    """Store one task's neighborhoods and seed orders beside its preparation."""
+    import numpy as np
+
+    out = Path(db_dir) / "sql_contexts" / task_name
+    out.mkdir(parents=True, exist_ok=True)
+    np.savez(out / "contexts.npz", seeds=contexts.seeds, offsets=contexts.offsets, nodes=contexts.nodes,
+             depths=contexts.depths, order_seeds=orders.seeds, order_offsets=orders.offsets,
+             candidates=orders.candidates)
+    (out / "key.json").write_text(json.dumps({"key": _rules_key(rules, width), "width": int(width)}) + "\n")
+
+
+def load_saved_contexts(db_dir, task_name, rules, width):
+    """Contexts and seed orders saved by :func:`save_contexts` for these rules, or None."""
+    import numpy as np
+
+    saved = Path(db_dir) / "sql_contexts" / task_name
+    if not (saved / "key.json").is_file():
+        return None
+    if json.loads((saved / "key.json").read_text()).get("key") != _rules_key(rules, width):
+        return None
+    z = np.load(saved / "contexts.npz")
+    return (SqlContexts(z["seeds"], z["offsets"], z["nodes"], z["depths"]),
+            SeedOrders(z["order_seeds"], z["order_offsets"], z["candidates"]))
+
+
+def raw_task_seeds(pre_dir, db_name, task_name, task):
+    """A raw preparation's task rows as one (seed, key, ts) frame, all splits."""
+    import pandas as pd
+
+    db_dir = Path(pre_dir) / db_name
+    info = json.loads((db_dir / "table_info.json").read_text())
+    raw_dir = Path(json.loads((db_dir / "meta.json").read_text())["raw_dataset_dir"])
+    return _seed_frame([
+        _task_rows(pd.read_parquet(raw_dir / "tasks" / task_name / f"{split}.parquet"), task, info, split)
+        for split in ("train", "val", "test")
+    ])
+
+
 def _seed_frame(splits):
     """All task rows as one (seed, key, ts) frame."""
     import pandas as pd
@@ -447,7 +515,6 @@ def load_raw_contexts(pre_dir, database, db_name, task_name, width, rules, timin
     translate SQL row positions into the encoder's row identifiers.
     """
     import duckdb
-    import pandas as pd
 
     task = rules["task"]
     db_dir = Path(pre_dir) / db_name
@@ -455,12 +522,16 @@ def load_raw_contexts(pre_dir, database, db_name, task_name, width, rules, timin
     meta = json.loads((db_dir / "meta.json").read_text())
     if meta.get("sampling_graph") is not False:
         raise ValueError("Raw SQL sampling requires graph-free cell preparation")
-    raw_dir = Path(meta["raw_dataset_dir"])
-    splits = [
-        _task_rows(pd.read_parquet(raw_dir / "tasks" / task_name / f"{split}.parquet"), task, info, split)
-        for split in ("train", "val", "test")
-    ]
-    seeds = _seed_frame(splits)
+    tick = time.perf_counter()
+    # Raw SQL preparation builds them before embedding (to embed only the text
+    # they reach); reuse them when built from the same rules and width.
+    saved = load_saved_contexts(db_dir, task_name, rules, width)
+    if saved is not None:
+        if timings is not None:
+            timings["SQL neighborhood queries and assembly"] = time.perf_counter() - tick
+            timings["SQL historical seed queries"] = 0.0
+        return saved
+    seeds = raw_task_seeds(pre_dir, db_name, task_name, task)
     con = duckdb.connect(resolve_duckdb(database, db_name), read_only=True)
     try:
         tick = time.perf_counter()

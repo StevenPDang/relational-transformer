@@ -38,22 +38,6 @@ def node_tasks(source):
     return names
 
 
-def cap_seeds(train, target_col, task_type, max_seeds, seed=0):
-    """At most ``max_seeds`` training rows; classification keeps every label's share.
-
-    Capping per label keeps rare labels from being swamped by the majority
-    when scoring (paper section 7.1). Row order is preserved.
-    """
-    if max_seeds is None or len(train) <= max_seeds:
-        return train
-    if task_type == "reg":
-        return train.sample(n=max_seeds, random_state=seed).sort_index()
-    groups = train.groupby(target_col)
-    per_label = max(1, max_seeds // groups.ngroups)
-    keep = [i for _, g in groups for i in g.sample(n=min(len(g), per_label), random_state=seed).index]
-    return train.loc[sorted(keep)]
-
-
 def select_one(args, source, db_name, db, schema, task_name):
     import duckdb
     import pandas as pd
@@ -67,7 +51,7 @@ def select_one(args, source, db_name, db, schema, task_name):
     task = relbench.load_task(source, task_name)
     info = metasieve.relbench_task_info(schema, db_name, task_name, task)
     train = task.get_table("train", mask_input_cols=False).df.reset_index(drop=True)
-    scored = cap_seeds(train, task.target_col, info["task_type"], args.max_seeds)
+    scored = metasieve.cap_seeds(train, task.target_col, info["task_type"], args.max_seeds)
     seeds = pd.DataFrame({
         "seed": scored.index.to_numpy(),
         "key": scored[task.entity_col].to_numpy(),
