@@ -389,19 +389,21 @@ def path_rows(con, schema, entity_table, seeds, paths, width, strict=False):
 
 
 def context_nodes(rows, table_info):
-    """Group :func:`path_rows` into ordered (node index, depth) lists per seed.
+    """Order :func:`path_rows` into each seed's (node index, depth) neighborhood.
 
-    Spine rows come first: hop-1 history rows interleaved by root rank across
-    hop-1 paths (most recent first, round-robin over history tables), each
-    followed by its forward parents. Rows past a later reverse step fan out
-    (e.g. other drivers' results in a race) and follow in the same order, so they only use budget
-    the spine leaves over. A row reached by several paths appears once, at its
-    first position.
+    Returns a DataFrame (seed, node, depth) grouped by seed in ascending order,
+    each seed's rows in context order. Spine rows come first: hop-1 history rows
+    interleaved by root rank across hop-1 paths (most recent first, round-robin
+    over history tables), each followed by its forward parents. Rows past a
+    later reverse step fan out (e.g. other drivers' results in a race) and
+    follow in the same order, so they only use budget the spine leaves over. A
+    row reached by several paths appears once, at its first position.
     """
     import numpy as np
+    import pandas as pd
 
     if rows.empty:
-        return {}
+        return pd.DataFrame({"seed": [], "node": [], "depth": []}, dtype="int64")
     rows = rows.copy()
     offsets = {t: int(table_info[f"{t}:Db"]["node_idx_offset"]) for t in rows["table"].unique()}
     rows["node"] = rows["table"].map(offsets).to_numpy(dtype="int64") + rows["rid"].to_numpy(dtype="int64")
@@ -411,7 +413,4 @@ def context_nodes(rows, table_info):
     rows = rows.sort_values(["seed", "fan_out", "root_rank", "root", "depth", "order", "neg_t", "rid"],
                             kind="stable")
     rows = rows.drop_duplicates(["seed", "node"], keep="first")
-    out = {}
-    for seed, group in rows.groupby("seed", sort=False):
-        out[int(seed)] = list(zip(group["node"].astype(int).tolist(), group["depth"].astype(int).tolist()))
-    return out
+    return rows[["seed", "node", "depth"]].astype("int64").reset_index(drop=True)

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 # Candidate historical seeds kept per seed. Full 8192-cell rel-f1 contexts use
@@ -36,6 +37,92 @@ ORDER BY s.seed, l.ts DESC, l.node_idx
 
 def _quote(name):
     return '"' + str(name).replace('"', '""') + '"'
+
+
+
+def _offsets(seeds, row_seeds):
+    """CSR offsets of each (sorted) seed's rows in ``row_seeds``, grouped in seed order."""
+    import numpy as np
+
+    return np.append(np.searchsorted(row_seeds, seeds), len(row_seeds)).astype("int64")
+
+
+@dataclass(frozen=True)
+class SqlContexts:
+    """Every seed's ordered neighborhood as CSR arrays for the Rust sampler.
+
+    Seed ``seeds[i]`` (strictly increasing) owns ``nodes[offsets[i]:offsets[i + 1]]``
+    with the matching ``depths``; flat arrays keep millions of task rows compact.
+    """
+
+    seeds: "np.ndarray"  # int32
+    offsets: "np.ndarray"  # int64, len(seeds) + 1
+    nodes: "np.ndarray"  # int32
+    depths: "np.ndarray"  # uint8
+
+    @classmethod
+    def from_rows(cls, seeds, row_seeds, nodes, depths):
+        """From rows already grouped by seed in ``seeds`` order (sorted, unique)."""
+        import numpy as np
+
+        depths = np.asarray(depths)
+        if len(depths) and (depths.min() < 0 or depths.max() > np.iinfo(np.uint8).max):
+            raise ValueError("SQL context depths must fit in uint8")
+        return cls(np.asarray(seeds, dtype="int32"), _offsets(seeds, row_seeds),
+                   np.asarray(nodes, dtype="int32"), depths.astype("uint8"))
+
+    @classmethod
+    def concat(cls, parts):
+        """Join contexts over consecutive, increasing seed ranges."""
+        import numpy as np
+
+        if not parts:
+            return cls.from_rows([], [], [], [])
+        starts = np.cumsum([0] + [len(p.nodes) for p in parts])
+        offsets = [p.offsets[:-1] + start for p, start in zip(parts, starts)] + [starts[-1:]]
+        return cls(np.concatenate([p.seeds for p in parts]), np.concatenate(offsets).astype("int64"),
+                   np.concatenate([p.nodes for p in parts]), np.concatenate([p.depths for p in parts]))
+
+    def with_seeds(self):
+        """Each neighborhood led by its own seed at depth 0."""
+        import numpy as np
+
+        starts = self.offsets[:-1]
+        return SqlContexts(self.seeds, self.offsets + np.arange(len(self.offsets)),
+                           np.insert(self.nodes, starts, self.seeds),
+                           np.insert(self.depths, starts, 0).astype("uint8"))
+
+    def __getitem__(self, seed):
+        import numpy as np
+
+        i = int(np.searchsorted(self.seeds, seed))
+        if i == len(self.seeds) or self.seeds[i] != seed:
+            raise KeyError(seed)
+        lo, hi = self.offsets[i], self.offsets[i + 1]
+        return list(zip(self.nodes[lo:hi].tolist(), self.depths[lo:hi].tolist()))
+
+    def to_dict(self):
+        return {int(seed): self[seed] for seed in self.seeds}
+
+
+@dataclass(frozen=True)
+class SeedOrders:
+    """Every seed's ordered historical seed candidates as CSR arrays."""
+
+    seeds: "np.ndarray"  # int32, strictly increasing
+    offsets: "np.ndarray"  # int64, len(seeds) + 1
+    candidates: "np.ndarray"  # int32
+
+    def __getitem__(self, seed):
+        import numpy as np
+
+        i = int(np.searchsorted(self.seeds, seed))
+        if i == len(self.seeds) or self.seeds[i] != seed:
+            raise KeyError(seed)
+        return self.candidates[self.offsets[i]:self.offsets[i + 1]].tolist()
+
+    def to_dict(self):
+        return {int(seed): self[seed] for seed in self.seeds}
 
 
 def resolve_duckdb(spec, db_name):
@@ -66,25 +153,19 @@ def load_metasieve_rules(spec, db_name, task_name):
     return rules
 
 
-def _register_seeds(con, seeds):
-    con.register("ms_ctx_seeds", seeds)
-    con.register("sql_task_labels", seeds.rename(columns={"seed": "node_idx"}))
-
-
-def _unregister_seeds(con):
-    con.unregister("ms_ctx_seeds")
-    con.unregister("sql_task_labels")
-
-
 def metasieve_context_nodes(con, table_info, rules, seeds, width, chunk=CONTEXT_CHUNK):
     """Batched neighborhoods from kept MetaSieve metapaths, for every seed.
 
     ``seeds`` has columns seed (task node index), key (entity key) and ts. Each
-    list holds the entity row, then up to ``width`` most recent earlier labels
-    of that entity, then the DB rows the kept metapaths reach (see
-    :func:`rt.metasieve.context_nodes`). Frontier tables are built ``chunk``
-    seeds at a time to bound DuckDB and pandas memory.
+    neighborhood holds the entity row, then up to ``width`` most recent earlier
+    labels of that entity, then the DB rows the kept metapaths reach (see
+    :func:`rt.metasieve.context_nodes`); returns :class:`SqlContexts`. Seeds are
+    processed ``chunk`` at a time in node order to bound DuckDB and pandas
+    memory, so no per-seed Python lists are built.
     """
+    import numpy as np
+    import pandas as pd
+
     from rt import metasieve
 
     if width <= 0:
@@ -92,58 +173,111 @@ def metasieve_context_nodes(con, table_info, rules, seeds, width, chunk=CONTEXT_
     task = rules["task"]
     entity = task["entity_table"]
     offset = int(table_info[f"{entity}:Db"]["node_idx_offset"])
-    contexts = {int(seed): [] for seed in seeds["seed"]}
-    _register_seeds(con, seeds)
-    try:
-        sql = ENTITY_SQL.format(table=_quote(entity), pkey=_quote(task["entity_pkey"]))
-        for seed, row in con.execute(sql).fetchall():
-            contexts[int(seed)].append((offset + int(row), 1))
-        for seed, node in con.execute(LABELS_SQL, [width]).fetchall():
-            contexts[int(seed)].append((int(node), 2))
-    finally:
-        _unregister_seeds(con)
+    seeds = seeds.sort_values("seed", kind="stable").reset_index(drop=True)
+    if seeds["seed"].duplicated().any():
+        raise ValueError("Duplicate SQL context seeds")
+    entity_sql = ENTITY_SQL.format(table=_quote(entity), pkey=_quote(task["entity_pkey"]))
     paths = metasieve.kept_paths(rules)
     strict = rules["params"].get("strict", False)
-    for start in range(0, len(seeds), chunk):
-        part = seeds.iloc[start:start + chunk]
-        rows = metasieve.path_rows(con, rules["schema"], entity, part, paths, width, strict=strict)
-        for seed, nodes in metasieve.context_nodes(rows, table_info).items():
-            seen = {node for node, _ in contexts[seed]}
-            contexts[seed].extend((node, depth) for node, depth in nodes if node not in seen)
-    return contexts
+    parts = []
+    # Every task row is a potential earlier label, whichever chunk its seed is in.
+    con.register("sql_task_labels", seeds.rename(columns={"seed": "node_idx"}))
+    try:
+        for start in range(0, len(seeds), chunk):
+            part = seeds.iloc[start:start + chunk]
+            con.register("ms_ctx_seeds", part)
+            try:
+                ent = con.execute(entity_sql).df()
+                labels = con.execute(LABELS_SQL, [width]).df()
+            finally:
+                con.unregister("ms_ctx_seeds")
+            rows = metasieve.path_rows(con, rules["schema"], entity, part, paths, width, strict=strict)
+            reached = metasieve.context_nodes(rows, table_info)
+            # Entity row, labels, then path rows per seed; a stable sort by seed
+            # keeps each part's own order, and a row appears once, first.
+            frame = pd.concat([
+                pd.DataFrame({"seed": ent["seed"], "node": offset + ent["rowid"].astype("int64"), "depth": 1}),
+                pd.DataFrame({"seed": labels["seed"], "node": labels["node_idx"], "depth": 2}),
+                reached,
+            ], ignore_index=True).astype("int64")
+            frame = frame.iloc[np.argsort(frame["seed"].to_numpy(), kind="stable")]
+            frame = frame[~frame.duplicated(["seed", "node"])]
+            # Compact per chunk (int32 nodes, uint8 depths) so peak memory is
+            # the flat result plus one chunk's frames.
+            parts.append(SqlContexts.from_rows(part["seed"].to_numpy(), frame["seed"].to_numpy(),
+                                               frame["node"].to_numpy(), frame["depth"].to_numpy()))
+    finally:
+        con.unregister("sql_task_labels")
+    return SqlContexts.concat(parts)
 
 
-def historical_seed_orders(seeds, limit=SEED_ORDER_LIMIT):
+def _ranges(starts, lengths):
+    """Concatenated ``arange(start, start + length)`` for each pair."""
+    import numpy as np
+
+    ends = np.cumsum(lengths)
+    return np.repeat(starts - (ends - lengths), lengths) + np.arange(ends[-1] if len(ends) else 0)
+
+
+def historical_seed_orders(seeds, limit=SEED_ORDER_LIMIT, chunk=None):
     """Candidate historical seeds for every seed; replaces random walks in raw SQL mode.
 
     Strictly earlier task rows, same entity first, then most recent (ties by
-    node index), at most ``limit`` per seed. All rows are sorted once by
-    recency; each seed's candidates are its entity's rows past its cutoff plus a
-    capped slice of the shared tail, so the cost is linear in seeds x limit
-    rather than quadratic in task rows.
+    node index), at most ``limit`` per seed; returns :class:`SeedOrders`. All
+    rows are sorted once by recency; each seed's candidates are its entity's
+    rows past its cutoff, then the other entities' rows among the next
+    ``limit`` positions, so the cost is linear in seeds x limit rather than
+    quadratic in task rows. Seeds are vectorized ``chunk`` at a time.
     """
     import numpy as np
     import pandas as pd
 
-    if seeds.empty:
-        return {}
+    seeds = seeds.sort_values("seed", kind="stable")
     node = seeds["seed"].to_numpy(dtype="int64")
+    if len(node) == 0:
+        return SeedOrders(node.astype("int32"), np.zeros(1, dtype="int64"), node.astype("int32"))
     ts = pd.to_datetime(seeds["ts"]).to_numpy("datetime64[ns]").astype("int64")
-    codes = pd.factorize(seeds["key"])[0]
+    codes = pd.factorize(seeds["key"])[0].astype("int64")
+    n = len(node)
     order = np.lexsort((node, -ts))  # newest first, then node index
-    g_node, g_neg_ts, g_code = node[order], -ts[order], codes[order]
-    # Positions in that order of each entity's rows, still newest first.
+    g_node, g_neg_ts, g_code = node[order].astype("int32"), -ts[order], codes[order]
+    # Positions in that order of each entity's rows, still newest first; the
+    # (entity, position) keys are sorted, so searches find per-entity cutoffs.
     by_code = np.argsort(g_code, kind="stable")
-    bounds = np.searchsorted(g_code[by_code], np.arange(codes.max() + 2))
-    orders = {}
-    for seed, seed_ts, code in zip(node, ts, codes):
-        start = np.searchsorted(g_neg_ts, -seed_ts, side="right")  # first strictly earlier row
-        own = by_code[bounds[code]:bounds[code + 1]]
-        own = own[own >= start][:limit]
-        window = np.arange(start, min(len(g_node), start + limit + len(own)))
-        other = window[g_code[window] != code][:limit - len(own)]
-        orders[int(seed)] = g_node[np.concatenate([own, other])].tolist()
-    return orders
+    keys = g_code[by_code] * n + by_code
+    ends = np.searchsorted(g_code[by_code], np.arange(codes.max() + 2))[1:]
+    chunk = chunk or max(1, 2**24 // max(limit, 1))
+    out_seeds, out_counts, out_cands = [], [], []
+    for lo in range(0, n, chunk):
+        c_ts, c_code = ts[lo:lo + chunk], codes[lo:lo + chunk]
+        start = np.searchsorted(g_neg_ts, -c_ts, side="right")  # first strictly earlier row
+        own_lo = np.searchsorted(keys, c_code * n + start)
+        n_own = np.minimum(ends[c_code] - own_lo, limit)
+        # Others: the first limit - n_own other-entity rows from the cutoff on.
+        # The next ``limit`` positions hold at most n_own own rows, so they suffice.
+        width = np.minimum(limit, n - start)
+        window = _ranges(start, width)
+        seg = np.repeat(np.arange(len(start)), width)
+        keep = g_code[window] != c_code[seg]
+        window, seg = window[keep], seg[keep]
+        count = np.bincount(seg, minlength=len(start))
+        rank = np.arange(len(seg)) - (np.cumsum(count) - count)[seg]
+        keep = rank < (limit - n_own)[seg]
+        window, seg = window[keep], seg[keep]
+        n_other = np.bincount(seg, minlength=len(start))
+        # Interleave per seed: own candidates, then others.
+        total = n_own + n_other
+        base = np.cumsum(total) - total
+        cands = np.empty(int(total.sum()), dtype="int32")
+        cands[_ranges(base, n_own)] = g_node[by_code[_ranges(own_lo, n_own)]]
+        cands[_ranges(base + n_own, n_other)] = g_node[window]
+        out_seeds.append(node[lo:lo + chunk])
+        out_counts.append(total)
+        out_cands.append(cands)
+    counts = np.concatenate(out_counts)
+    return SeedOrders(np.concatenate(out_seeds).astype("int32"),
+                      np.append(0, np.cumsum(counts)).astype("int64"),
+                      np.concatenate(out_cands))
 
 
 def _seed_frame(splits):
@@ -233,8 +367,7 @@ def load_contexts(pre_dir, database, db_name, task_name, width, rules):
             if stored != seconds.tolist():
                 raise ValueError(f"Preprocessed task timestamps differ for {task_name} {split}")
             splits.append(rows)
-        contexts = metasieve_context_nodes(con, info, rules, _seed_frame(splits), width)
-        return {seed: [(seed, 0)] + nodes for seed, nodes in contexts.items()}
+        return metasieve_context_nodes(con, info, rules, _seed_frame(splits), width).with_seeds()
     finally:
         con.close()
 
@@ -264,8 +397,7 @@ def load_raw_contexts(pre_dir, database, db_name, task_name, width, rules, timin
     con = duckdb.connect(resolve_duckdb(database, db_name), read_only=True)
     try:
         tick = time.perf_counter()
-        batched = metasieve_context_nodes(con, info, rules, seeds, width)
-        contexts = {seed: [(seed, 0)] + nodes for seed, nodes in batched.items()}
+        contexts = metasieve_context_nodes(con, info, rules, seeds, width).with_seeds()
         if timings is not None:
             timings["SQL neighborhood queries and assembly"] = time.perf_counter() - tick
         tick = time.perf_counter()

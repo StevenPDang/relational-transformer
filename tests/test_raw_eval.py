@@ -120,8 +120,9 @@ def test_raw_sql_needs_no_traversal_graph_and_preserves_model_encoding(raw_f1, z
     assert all(idx < test_start or idx >= test_start + 2 for idx in orders[test_start])
     sql_ds = RustlerDataset(**dataset_kwargs(sql_dir, database, rules_path))
     bfs_ds = RustlerDataset(**dataset_kwargs(bfs_dir))
-    bfs_ds.sampler.set_sql_contexts_py("rel-f1", contexts)
-    bfs_ds.sampler.set_sql_seed_order_py("rel-f1", orders)
+    bfs_ds.sampler.set_sql_contexts_py("rel-f1", contexts.seeds, contexts.offsets, contexts.nodes,
+                                       contexts.depths)
+    bfs_ds.sampler.set_sql_seed_order_py("rel-f1", orders.seeds, orders.offsets, orders.candidates)
     # Identical SQL selection through graph-backed vs graph-free encoders must
     # give identical model tensors, including foreign-key attention metadata.
     sql_batch = sql_ds._process_batch(sql_ds.sampler.batch_py(0, 2, 256))
@@ -137,10 +138,17 @@ def test_raw_sql_needs_no_traversal_graph_and_preserves_model_encoding(raw_f1, z
     no_walk_batch = no_walk_ds._process_batch(no_walk_ds.sampler.batch_py(0, 2, 256))
     for key, value in sql_batch.items():
         torch.testing.assert_close(value, no_walk_batch[key], rtol=0, atol=0, equal_nan=True)
-    invalid_orders = dict(orders)
-    invalid_orders[test_start] = [test_start + 1]
+    # Seed test_start's candidates replaced by its same-time sibling.
+    i = int(np.searchsorted(orders.seeds, test_start))
+    lo, hi = orders.offsets[i], orders.offsets[i + 1]
+    candidates = np.concatenate([orders.candidates[:lo], [test_start + 1], orders.candidates[hi:]]).astype(np.int32)
+    offsets = orders.offsets.copy()
+    offsets[i + 1:] += 1 - (hi - lo)
     with pytest.raises(ValueError, match="earlier same-table"):
-        sql_ds.sampler.set_sql_seed_order_py("rel-f1", invalid_orders)
+        sql_ds.sampler.set_sql_seed_order_py("rel-f1", orders.seeds, offsets, candidates)
+    with pytest.raises(ValueError, match="different seeds"):
+        sql_ds.sampler.set_sql_seed_order_py("rel-f1", orders.seeds[1:], orders.offsets[1:] - orders.offsets[1],
+                                             orders.candidates[orders.offsets[1]:])
 
 
 @pytest.mark.parametrize("sampler", ["sql", "bfs"])

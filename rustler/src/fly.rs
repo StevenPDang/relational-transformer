@@ -11,7 +11,7 @@ use half::bf16;
 use indicatif::{ProgressBar, ProgressStyle};
 use itertools::izip;
 use memmap2::{Mmap, MmapOptions};
-use numpy::PyArray1;
+use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::IntoPyObjectExt;
 use pyo3::PyObject;
 use pyo3::PyResult;
@@ -332,6 +332,62 @@ unsafe impl Send for VectorDbEntry {}
 #[cfg(feature = "vecdb")]
 unsafe impl Sync for VectorDbEntry {}
 
+/// Per-seed rows in CSR form: `seeds[i]` owns rows `offsets[i]..offsets[i + 1]`.
+/// Seeds are strictly increasing, so lookups are binary searches.
+struct SeedIndex {
+    seeds: Vec<i32>,
+    offsets: Vec<usize>,
+}
+
+impl SeedIndex {
+    fn new(seeds: &[i32], offsets: &[i64], num_rows: usize) -> Result<Self, &'static str> {
+        if offsets.len() != seeds.len() + 1 {
+            return Err("SQL offsets must have one more entry than seeds");
+        }
+        if seeds.windows(2).any(|w| w[0] >= w[1]) {
+            return Err("SQL seeds must be strictly increasing");
+        }
+        if offsets[0] != 0
+            || offsets[seeds.len()] as usize != num_rows
+            || offsets.windows(2).any(|w| w[0] > w[1])
+        {
+            return Err("SQL offsets must rise from 0 to the number of rows");
+        }
+        Ok(Self {
+            seeds: seeds.to_vec(),
+            offsets: offsets.iter().map(|&o| o as usize).collect(),
+        })
+    }
+
+    fn range(&self, seed: i32) -> Option<std::ops::Range<usize>> {
+        let i = self.seeds.binary_search(&seed).ok()?;
+        Some(self.offsets[i]..self.offsets[i + 1])
+    }
+
+    fn contains(&self, seed: i32) -> bool {
+        self.seeds.binary_search(&seed).is_ok()
+    }
+}
+
+/// Each seed's ordered (node, depth) neighborhood.
+struct SqlContexts {
+    index: SeedIndex,
+    nodes: Vec<i32>,
+    depths: Vec<u8>,
+}
+
+/// Each seed's ordered historical seed candidates.
+struct SqlSeedOrder {
+    index: SeedIndex,
+    candidates: Vec<i32>,
+}
+
+impl SqlSeedOrder {
+    fn get(&self, seed: i32) -> &[i32] {
+        &self.candidates[self.index.range(seed).expect("SQL seed order missing seed")]
+    }
+}
+
 struct Dataset {
     mmap: Mmap,
     text_mmap: Mmap,
@@ -339,8 +395,8 @@ struct Dataset {
     offsets: Vec<i64>,
     table_info: HashMap<String, TableInfo>,
     // Opt-in neighborhoods materialized by task-specific, non-recursive SQL.
-    sql_contexts: Option<HashMap<i32, Vec<(i32, usize)>>>,
-    sql_seed_order: Option<HashMap<i32, Vec<i32>>>,
+    sql_contexts: Option<SqlContexts>,
+    sql_seed_order: Option<SqlSeedOrder>,
     // When `Some`, a deterministic bijection over this database's column
     // indices used to ablate schema semantics: at col_name_values lookup
     // time, the original col_name_idx is replaced by col_name_perm[orig]
@@ -506,21 +562,29 @@ impl Sampler {
         self.items.len()
     }
 
+    /// Install SQL neighborhoods as CSR arrays: seed `seeds[i]` owns
+    /// `nodes[offsets[i]..offsets[i + 1]]` with the matching `depths`.
     fn set_sql_contexts_py(
         &mut self,
         db_name: &str,
-        contexts: HashMap<i32, Vec<(i32, usize)>>,
+        seeds: PyReadonlyArray1<'_, i32>,
+        offsets: PyReadonlyArray1<'_, i64>,
+        nodes: PyReadonlyArray1<'_, i32>,
+        depths: PyReadonlyArray1<'_, u8>,
     ) -> PyResult<()> {
         use pyo3::exceptions::PyValueError;
         let dataset = self
             .datasets
             .get_mut(db_name)
             .ok_or_else(|| PyValueError::new_err("Unknown SQL context database"))?;
-        let valid = |idx: i32| idx >= 0 && (idx as usize) < dataset.offsets.len() - 1;
-        if contexts
-            .iter()
-            .any(|(&seed, nodes)| !valid(seed) || nodes.iter().any(|&(idx, _)| !valid(idx)))
-        {
+        let (seeds, nodes, depths) = (seeds.as_slice()?, nodes.as_slice()?, depths.as_slice()?);
+        if nodes.len() != depths.len() {
+            return Err(PyValueError::new_err("SQL context nodes and depths differ in length"));
+        }
+        let index = SeedIndex::new(seeds, offsets.as_slice()?, nodes.len())
+            .map_err(PyValueError::new_err)?;
+        let valid = |idx: &i32| *idx >= 0 && (*idx as usize) < dataset.offsets.len() - 1;
+        if !seeds.iter().all(valid) || !nodes.iter().all(valid) {
             return Err(PyValueError::new_err("SQL context node index out of range"));
         }
         // Every possible same-table seed needs an entry; never silently fall
@@ -528,47 +592,60 @@ impl Sampler {
         for ((db, _, _, _), &(start, end)) in
             self.dataset_tuples.iter().zip(self.table_ranges.iter())
         {
-            if db == db_name && (start..end).any(|idx| !contexts.contains_key(&idx)) {
+            if db == db_name && (start..end).any(|idx| !index.contains(idx)) {
                 return Err(PyValueError::new_err(
                     "SQL contexts missing same-table seeds",
                 ));
             }
         }
-        dataset.sql_contexts = Some(contexts);
+        dataset.sql_contexts = Some(SqlContexts {
+            index,
+            nodes: nodes.to_vec(),
+            depths: depths.to_vec(),
+        });
         Ok(())
     }
 
-    /// Replace walk ranking with a SQL-ordered list of historical task rows.
+    /// Replace walk ranking with a SQL-ordered list of historical task rows,
+    /// as CSR arrays over exactly the seeds of the SQL contexts.
     fn set_sql_seed_order_py(
         &mut self,
         db_name: &str,
-        orders: HashMap<i32, Vec<i32>>,
+        seeds: PyReadonlyArray1<'_, i32>,
+        offsets: PyReadonlyArray1<'_, i64>,
+        candidates: PyReadonlyArray1<'_, i32>,
     ) -> PyResult<()> {
         use pyo3::exceptions::PyValueError;
         let dataset = self.datasets.get_mut(db_name)
             .ok_or_else(|| PyValueError::new_err("Unknown SQL context database"))?;
         let contexts = dataset.sql_contexts.as_ref()
             .ok_or_else(|| PyValueError::new_err("Set SQL contexts before SQL seed order"))?;
-        if contexts.keys().any(|idx| !orders.contains_key(idx)) {
-            return Err(PyValueError::new_err("SQL seed order missing seeds"));
+        let candidates = candidates.as_slice()?;
+        let index = SeedIndex::new(seeds.as_slice()?, offsets.as_slice()?, candidates.len())
+            .map_err(PyValueError::new_err)?;
+        if index.seeds != contexts.index.seeds {
+            return Err(PyValueError::new_err("SQL seed order and contexts cover different seeds"));
         }
-        for (&seed, candidates) in &orders {
-            if !contexts.contains_key(&seed) {
-                return Err(PyValueError::new_err("SQL seed order contains unknown seed"));
-            }
-            let source = get_node(dataset, seed);
-            for &idx in candidates {
-                if !contexts.contains_key(&idx) {
+        let shared: &Dataset = dataset;
+        (0..index.seeds.len()).into_par_iter().try_for_each(|i| {
+            let seed = index.seeds[i];
+            let source = get_node(shared, seed);
+            for &idx in &candidates[index.offsets[i]..index.offsets[i + 1]] {
+                if !contexts.index.contains(idx) {
                     return Err(PyValueError::new_err("SQL candidate missing context"));
                 }
-                let node = get_node(dataset, idx);
+                let node = get_node(shared, idx);
                 if idx == seed || node.table_name_idx != source.table_name_idx
                     || node.timestamp >= source.timestamp {
                     return Err(PyValueError::new_err("SQL candidates must be earlier same-table rows"));
                 }
             }
-        }
-        dataset.sql_seed_order = Some(orders);
+            Ok(())
+        })?;
+        dataset.sql_seed_order = Some(SqlSeedOrder {
+            index,
+            candidates: candidates.to_vec(),
+        });
         Ok(())
     }
 
@@ -1265,7 +1342,7 @@ impl Sampler {
         assert!(dataset.p2f_adj_mmap.is_some()
             || (dataset.sql_contexts.is_some() && dataset.sql_seed_order.is_some()),
             "Graph-free cells require SQL contexts and SQL seed ordering");
-        let sql_order = dataset.sql_seed_order.as_ref().map(|orders| &orders[&target_node_idx]);
+        let sql_order = dataset.sql_seed_order.as_ref().map(|orders| orders.get(target_node_idx));
         let visit_counts = if sql_order.is_some() {
             HashMap::new()
         } else if !use_vector_db && self.num_walks > 0 {
@@ -1287,7 +1364,7 @@ impl Sampler {
         // equal-key seeds don't cluster by HashMap iteration order.
         // - prefer_latest=true:  (ts desc, count desc, random)
         // - prefer_latest=false: (count desc, random)
-        let mut visited_sorted: Vec<i32> = sql_order.cloned()
+        let mut visited_sorted: Vec<i32> = sql_order.map(<[i32]>::to_vec)
             .unwrap_or_else(|| visit_counts.keys().copied().collect());
         let priority: HashMap<i32, u64> = visited_sorted
             .iter()
@@ -1941,11 +2018,12 @@ impl Sampler {
         deadline: Instant,
     ) -> Vec<(i32, usize)> {
         if let Some(contexts) = &dataset.sql_contexts {
-            let nodes = contexts.get(&start_idx).expect("SQL context missing seed");
+            let rows = contexts.index.range(start_idx).expect("SQL context missing seed");
             let seed = get_node(dataset, start_idx);
             let mut result = Vec::new();
             let mut num_cells = 0;
-            for &(idx, depth) in nodes {
+            for (&idx, &depth) in contexts.nodes[rows.clone()].iter().zip(&contexts.depths[rows]) {
+                let depth = depth as usize;
                 check_deadline(deadline);
                 if visited_at_depth
                     .get(&idx)

@@ -2,7 +2,7 @@ import duckdb
 import pandas as pd
 import pytest
 
-from rt.sql_context import historical_seed_orders
+from rt.sql_context import SqlContexts, historical_seed_orders
 
 # The per-seed query this batched version replaced; kept as the reference order.
 PER_SEED_ORDER_SQL = """
@@ -23,7 +23,7 @@ def test_batched_seed_order_matches_per_seed_queries():
     try:
         orders = historical_seed_orders(seeds, limit=len(seeds))
         assert historical_seed_orders(seeds, limit=2)[505] == orders[505][:2]
-        assert historical_seed_orders(seeds, limit=1) == {s: o[:1] for s, o in orders.items()}
+        assert historical_seed_orders(seeds, limit=1).to_dict() == {s: o[:1] for s, o in orders.to_dict().items()}
         con.register("labels", seeds.rename(columns={"seed": "node_idx"}))
         for seed, key, ts in seeds.itertuples(index=False, name=None):
             expected = [n for n, in con.execute(PER_SEED_ORDER_SQL, [ts.to_pydatetime(), key]).fetchall()]
@@ -64,15 +64,27 @@ def test_rust_sql_neighborhood_bypasses_bfs_and_filters_future_nodes(synthetic_d
     )
     sampler = ds.sampler
     baseline = ds._process_batch(sampler.batch_py(0, n, 128))
+
+    def install(contexts):
+        seeds = sorted(contexts)
+        rows = np.array([(seed, node, depth) for seed in seeds for node, depth in contexts[seed]],
+                        dtype=np.int64).reshape(-1, 3)
+        csr = SqlContexts.from_rows(seeds, *rows.T)
+        sampler.set_sql_contexts_py('synth', csr.seeds, csr.offsets, csr.nodes, csr.depths)
+
     with pytest.raises(ValueError, match='missing'):
-        sampler.set_sql_contexts_py('synth', {})
+        install({})
     contexts = {i: [(i, 0), (start + n - 1, 1)] for i in range(start, start + n)}
     bad = dict(contexts)
     total = sum(t['num_nodes'] for t in info.values())
     bad[start] = [(total, 0)]
     with pytest.raises(ValueError, match='out of range'):
-        sampler.set_sql_contexts_py('synth', bad)
-    sampler.set_sql_contexts_py('synth', contexts)
+        install(bad)
+    with pytest.raises(ValueError, match='strictly increasing'):
+        sampler.set_sql_contexts_py('synth', np.array([start + 1, start], dtype=np.int32),
+                                    np.zeros(3, dtype=np.int64), np.zeros(0, dtype=np.int32),
+                                    np.zeros(0, dtype=np.uint8))
+    install(contexts)
     batch = ds._process_batch(sampler.batch_py(0, n, 128))
     assert batch['is_targets'][:, 0].all()
     assert (batch['is_targets'].sum(dim=1) == 1).all()
@@ -85,3 +97,27 @@ def test_rust_sql_neighborhood_bypasses_bfs_and_filters_future_nodes(synthetic_d
     # The ordinary BFS reaches user rows, while SQL contexts contain only events.
     baseline_nodes = baseline['node_idxs'][~baseline['is_padding']]
     assert ((baseline_nodes < start) | (baseline_nodes >= start + n)).any()
+
+
+def test_seed_order_chunks_and_limits_match_per_seed_queries():
+    import numpy as np
+
+    rng = np.random.default_rng(0)
+    n = 300
+    seeds = pd.DataFrame({
+        "seed": rng.permutation(np.arange(1000, 1000 + n)),
+        "key": rng.integers(0, 12, n),
+        # Few distinct days, so many rows tie on time.
+        "ts": pd.Timestamp("2020-01-01") + pd.to_timedelta(rng.integers(0, 40, n), unit="D"),
+    })
+    con = duckdb.connect()
+    try:
+        con.register("labels", seeds.rename(columns={"seed": "node_idx"}))
+        for limit, chunk in [(5, 7), (40, 1), (n, None)]:
+            orders = historical_seed_orders(seeds, limit=limit, chunk=chunk)
+            assert orders.seeds.tolist() == sorted(seeds["seed"])
+            for seed, key, ts in seeds.itertuples(index=False, name=None):
+                expected = [r for r, in con.execute(PER_SEED_ORDER_SQL, [ts.to_pydatetime(), key]).fetchall()]
+                assert orders[seed] == expected[:limit]
+    finally:
+        con.close()

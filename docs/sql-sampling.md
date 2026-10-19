@@ -97,9 +97,17 @@ most 1,024 candidate historical seeds (full 8,192-cell rel-f1 contexts use at
 most 39 with SQL neighborhoods, 135 with BFS), so time and memory grow
 linearly with task rows. On a local raw rel-f1 preparation, setup takes 3.7 s
 for driver-top3 (2.7K task rows), 7.5 s for driver-position (8.7K) and 11.4 s
-for driver-dnf (12.7K). The neighborhoods are held in Python until Rust copies
-them, so tasks with millions of rows (rel-amazon) need more memory than that
-path is designed for.
+for driver-dnf (12.7K).
+
+Neighborhoods and seed orders reach Rust as flat CSR arrays (seed ids,
+offsets, int32 nodes, uint8 depths; int32 candidates), built per chunk with
+NumPy rather than as per-seed Python lists, so each neighborhood row costs 5
+bytes and each candidate 4. On driver-dnf the handoff holds 91 MB instead of
+851 MB. Seed orders still store up to 1,024 candidates per seed, which
+dominates at scale: rel-f1 averages about 300 neighborhood rows and 950
+candidates per seed, so a task with about 5.5M rows such as rel-amazon
+user-churn needs roughly 8 GB for neighborhoods and 21 GB for seed orders, held once in Rust
+(plus one transient copy in NumPy during the handoff).
 
 ## Run folders
 

@@ -267,17 +267,21 @@ class RustlerDataset:
                     timings=setup_timings,
                 )
                 tick = time.perf_counter()
-                self.sampler.set_sql_contexts_py(db_name, contexts)
+                self.sampler.set_sql_contexts_py(db_name, contexts.seeds, contexts.offsets,
+                                                 contexts.nodes, contexts.depths)
+                del contexts
                 if setup_timings is not None:
                     setup_timings["Rust context transfer and validation"] = time.perf_counter() - tick
                 tick = time.perf_counter()
-                self.sampler.set_sql_seed_order_py(db_name, orders)
+                self.sampler.set_sql_seed_order_py(db_name, orders.seeds, orders.offsets, orders.candidates)
+                del orders
                 if setup_timings is not None:
                     setup_timings["Rust seed order transfer and validation"] = time.perf_counter() - tick
             else:
                 contexts = load_contexts(pre_dir, sql_context_db, db_name, task_name,
                                          max(bfs_widths), rules)
-                self.sampler.set_sql_contexts_py(db_name, contexts)
+                self.sampler.set_sql_contexts_py(db_name, contexts.seeds, contexts.offsets,
+                                                 contexts.nodes, contexts.depths)
 
         self.d_text = d_text
         self.bool_as_num = bool_as_num

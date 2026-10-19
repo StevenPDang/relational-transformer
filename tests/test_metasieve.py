@@ -49,6 +49,11 @@ def seeds(*rows):
     return pd.DataFrame(rows, columns=["seed", "key", "ts"]).astype({"ts": "datetime64[ns]"})
 
 
+def by_seed(frame):
+    """:func:`metasieve.context_nodes` output as {seed: [(node, depth), ...]}."""
+    return {seed: list(zip(g["node"].tolist(), g["depth"].tolist())) for seed, g in frame.groupby("seed")}
+
+
 def by_name(paths):
     return {metasieve.path_name(p): p for p in paths}
 
@@ -129,7 +134,7 @@ def test_context_rows_cap_rev_steps_and_keep_children_beside_parents(con):
             paths["<-results.driverId ->races[raceId] ->circuits[circuitId]"]]
     s = seeds((900, 42, "2020-01-03"))
     rows = metasieve.path_rows(con, SCHEMA, "drivers", s, kept, width=2)
-    nodes = metasieve.context_nodes(rows, INFO)[900]
+    nodes = by_seed(metasieve.context_nodes(rows, INFO))[900]
     # Two most recent results (rowids 1: race 13, 3: race 14), each followed by its race;
     # the shared circuit appears once, beside the first race.
     assert nodes == [(201, 2), (301, 3), (450, 4), (203, 2), (302, 3)]
@@ -142,7 +147,7 @@ def test_fan_out_rows_follow_the_whole_spine(con):
     kept = [paths["<-results.driverId"], paths["<-results.driverId ->races[raceId]"],
             paths["<-results.driverId ->races[raceId] <-results.raceId"]]
     s = seeds((900, 42, "2020-01-03"))
-    nodes = metasieve.context_nodes(metasieve.path_rows(con, SCHEMA, "drivers", s, kept, width=3), INFO)[900]
+    nodes = by_seed(metasieve.context_nodes(metasieve.path_rows(con, SCHEMA, "drivers", s, kept, width=3), INFO))[900]
     # Every history row and its race first; then other results in those races,
     # capped at 3 (two are the driver's own rows), so only driver 7's result 204 is new.
     assert nodes == [(201, 2), (301, 3), (203, 2), (302, 3), (200, 2), (300, 3), (204, 4)]
@@ -162,7 +167,7 @@ def test_contexts_put_entity_and_labels_before_metapath_rows(con):
     assert ctx[501] == [(100, 1)]  # driver 42 had no results before 2019-06-01
     assert ctx[503] == [(101, 1)]
     # Chunking frontiers changes nothing.
-    assert metasieve_context_nodes(con, INFO, rules, s, width=4, chunk=1) == ctx
+    assert metasieve_context_nodes(con, INFO, rules, s, width=4, chunk=1).to_dict() == ctx.to_dict()
 
 
 def test_any_schema_entity_key_names_and_string_keys():
@@ -198,7 +203,7 @@ def test_any_schema_entity_key_names_and_string_keys():
     assert [n for n, _ in ctx[901] if 30 <= n < 40] == [31, 30]
     assert {21, 20} <= {n for n, _ in ctx[901]}
     assert ctx[902][0] == (11, 1) and 30 + 2 in {n for n, _ in ctx[902]}
-    assert orders == {900: [], 901: [900], 902: [900]}
+    assert orders.to_dict() == {900: [], 901: [900], 902: [900]}
 
 
 def test_rules_resolve_per_task_and_reject_other_tasks(tmp_path):
