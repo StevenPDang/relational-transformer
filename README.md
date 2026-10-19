@@ -1,6 +1,7 @@
 # Relational Transformer (RT)
 
 [![Website](https://img.shields.io/badge/website-RT--J-8C1515?logo=googlechrome&logoColor=white)](https://star-project.stanford.edu/rt-j)
+[![arXiv](https://img.shields.io/badge/arXiv-2610.17867-B31B1B?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2610.17867)
 [![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-stanford--star-yellow)](https://huggingface.co/stanford-star)
 [![PyPI](https://img.shields.io/pypi/v/relational-transformer?logo=pypi&logoColor=white)](https://pypi.org/project/relational-transformer/)
 [![Python](https://img.shields.io/pypi/pyversions/relational-transformer?logo=python&logoColor=white)](https://pypi.org/project/relational-transformer/)
