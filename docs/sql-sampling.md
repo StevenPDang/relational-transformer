@@ -109,6 +109,22 @@ candidates per seed, so a task with about 5.5M rows such as rel-amazon
 user-churn needs roughly 8 GB for neighborhoods and 21 GB for seed orders, held once in Rust
 (plus one transient copy in NumPy during the handoff).
 
+## One-shot coverage
+
+For one cold raw run, preparation dominates: on rel-trial study-outcome, text
+embeddings take ~375-385 s of a ~500 s run with either sampler. SQL contexts
+only reach the rows their kept metapaths select, so after a raw SQL run,
+
+```bash
+pixi run --environment cuda124 python -m scripts.context_coverage --run runs/eval/<tasks>/<timestamp>_raw-sql-metasieve
+```
+
+reports the rows and distinct texts the contexts can look up, for every task
+row and for the test split alone (test rows, their candidate seeds and those
+rows' neighborhoods), with the embedding time a contexts-only preparation would
+need at the run's per-character rate. On rel-f1 the test-split contexts touch
+26-34% of rows and 20-24% of text characters.
+
 ## Run folders
 
 Without `--out-dir`, every eval run writes its submission CSVs and

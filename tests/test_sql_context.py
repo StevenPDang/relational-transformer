@@ -121,3 +121,23 @@ def test_seed_order_chunks_and_limits_match_per_seed_queries():
                 assert orders[seed] == expected[:limit]
     finally:
         con.close()
+
+
+def test_node_text_ids_cover_only_the_requested_nodes(synthetic_dataset, tmp_path):
+    import json
+
+    from rt._rustler import node_text_ids, preprocess
+
+    pre = tmp_path / 'pre'
+    preprocess(str(synthetic_dataset), str(pre), skip_tasks=True)
+    db = pre / 'synth'
+    texts = json.loads((db / 'text.json').read_text())
+    total = sum(t['num_nodes'] for t in json.loads((db / 'table_info.json').read_text()).values())
+    values, names = node_text_ids(str(db), list(range(total)))
+    assert values == sorted(set(values)) and names == sorted(set(names))
+    assert set(values) | set(names) <= set(range(len(texts)))
+    assert names, 'every cell has a column-name embedding'
+    one_values, one_names = node_text_ids(str(db), [0])
+    assert set(one_values) <= set(values) and set(one_names) <= set(names)
+    with pytest.raises(IndexError, match='out of range'):
+        node_text_ids(str(db), [total + 5])
