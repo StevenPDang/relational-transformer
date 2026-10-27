@@ -79,9 +79,12 @@ gaps to the current system, roughly in order of expected payoff:
    rows) with a GROUP BY.
 2. **Children.** The sampler draws up to `bfs_width` children at random. v0
    takes the most recent.
-3. **Query count.** v0 runs one query per table or FK per BFS level per seed
-   (about 70 for a 1024-token context on mini-shop). Expanding all seeds'
-   levels together would cut that by the number of seeds.
+3. **Query count.** By default each seed's BFS levels are their own queries
+   (about 340 for an 8192-token context on mini-shop). `--seed-batch N`
+   expands N seeds together: on mini-shop, N=4 runs 3.3x fewer queries and
+   retrieves 1.7x faster, but seeds in a batch no longer skip each other's
+   rows, so contexts change (89% of rows shared with N=1). Larger N fetches
+   and decodes many rows it never keeps; decoding only claimed rows is next.
 4. **Speed at scale.** Per-database setup (schema and statistics) is cached in
    the `Encoder`. Text embeddings are cached per string. On GPU, the model
    runs compiled.

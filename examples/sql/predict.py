@@ -111,6 +111,12 @@ def main():
     p.add_argument("--ctx-size", type=int, default=512)
     p.add_argument("--local-ctx-size", type=int, default=256)
     p.add_argument("--bfs-width", type=int, default=32)
+    p.add_argument(
+        "--seed-batch",
+        type=int,
+        default=1,
+        help="seeds expanded together, one query per BFS step for the batch",
+    )
     p.add_argument("--bs", type=int, default=8)
     p.add_argument(
         "--chunk", type=int, default=16, help="contexts built and predicted at once"
@@ -169,6 +175,7 @@ def main():
             ctx_size=args.ctx_size,
             local_ctx_size=args.local_ctx_size,
             bfs_width=args.bfs_width,
+            seed_batch=args.seed_batch,
         ),
     )
     embed = rs.TextEmbedder(args.embedder, args.device)

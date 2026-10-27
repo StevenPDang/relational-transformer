@@ -17,13 +17,16 @@ made deterministic so a context can be replayed and traced:
    untimestamped seed, only untimestamped children are read, as in the
    sampler.
 
-Each step is one query per table or FK over the whole BFS level, never one
-query per row.
+Each step is one query per table or FK over the whole BFS level of a batch
+of `seed_batch` seeds, never one query per row or per seed. With
+`seed_batch=1`, seeds expand one after another and each skips what earlier
+seeds reached; in a batch, seeds expand independently and a row two of them
+reach is added once, by the first.
 """
 
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import duckdb
 
@@ -38,6 +41,33 @@ class RetrieveConfig:
     local_ctx_size: int = 128
     bfs_width: int = 16
     example_batch: int = 64  # labelled seeds fetched per query
+    seed_batch: int = 1  # seeds expanded together, one query per BFS step
+
+
+# Each wanted row with its seed's time bound and index, one parameter array each.
+_WANTED = (
+    "(SELECT unnest(?::BIGINT[]) AS __pid, unnest(?::BIGINT[]) AS __bound, "
+    "unnest(?::BIGINT[]) AS __seed)"
+)
+
+
+@dataclass
+class _SeedBfs:
+    """One seed's breadth-first expansion, advanced a level at a time."""
+
+    seed_i: int
+    table: Table
+    node: Node
+    level: list[Node] = field(default_factory=list)
+    depth: int = 0
+    cells: int = 0
+    seen: set[tuple[str, int]] = field(default_factory=set)
+    collected: list[Node] = field(default_factory=list)  # in BFS order
+    frontier: list[Node] = field(default_factory=list)  # claimed on this level
+    wanted: list[tuple[Table, int, str]] = field(default_factory=list)
+
+    def __post_init__(self):
+        self.level = [self.node]
 
 
 def _ts_expr(t: Table, alias: str = "") -> str | None:
@@ -121,14 +151,21 @@ class Retriever:
         seeds_iter = self._examples(ctx, task, target, target_table)
         seed_i = 0
         while len(ctx.tokens) < self.cfg.ctx_size:
-            if seed_i >= len(seeds):
+            while len(seeds) < seed_i + self.cfg.seed_batch:
                 more = next(seeds_iter, None)
                 if more is None:
                     break
                 seeds.append(more)
-            t, seed_node = seeds[seed_i]
-            self._expand(ctx, seed_i, t, seed_node, target, visited, expanded)
-            seed_i += 1
+            batch = [
+                (i, t, node)
+                for i, (t, node) in enumerate(
+                    seeds[seed_i : seed_i + self.cfg.seed_batch], seed_i
+                )
+            ]
+            if not batch:
+                break
+            self._expand_batch(ctx, batch, target, visited, expanded)
+            seed_i += len(batch)
         ctx.tokens = ctx.tokens[: self.cfg.ctx_size]
         return ctx
 
@@ -217,50 +254,60 @@ class Retriever:
                 t = task.splits[split]
                 yield t, self._node(t, fetched[(split, r)], 0, 0, "example")
 
-    def _expand(self, ctx, seed_i, seed_table, seed_node, target, visited, expanded):
-        """Breadth-first expansion of one seed, appending its rows' cells."""
-        # As in the sampler: a seed's neighbourhood is read as of the seed's own
-        # time, so an example's rows match what was known when its label was set.
-        bound = seed_node.timestamp
+    def _expand_batch(self, ctx, seeds, target, visited, expanded):
+        """Breadth-first expansion of several seeds at once, appending their cells.
+
+        Each BFS level is one query per table or FK for every seed in the batch,
+        with each row carrying its seed's time bound. Seeds in a batch expand
+        independently and are appended in seed order; a row another seed in the
+        batch already added is skipped then, as across batches.
+        """
         target_ts = target.timestamp
-        seed_node.seed = seed_i
-        level = [seed_node]
-        depth = 0
-        cells = 0
-        while level:
-            nxt: list[tuple[Table, int, str]] = []  # (table, row, via) to fetch
-            frontier: list[Node] = []
-            for node in level:
-                if node.key in expanded:
-                    continue
-                cells += len(node.cells) + (1 if node is target else 0)
-                if cells >= self.cfg.local_ctx_size and node is not seed_node:
-                    return
+        states = [_SeedBfs(seed_i, t, node) for seed_i, t, node in seeds]
+        for st in states:
+            st.node.seed = st.seed_i
+        while any(st.level for st in states):
+            for st in states:
+                self._take_level(st, target, expanded)
+            parents = self._fetch_parents(ctx, states)
+            children = self._fetch_children(ctx, states, target_ts)
+            for st in states:
+                st.level = parents.get(st.seed_i, []) + children.get(st.seed_i, [])
+                st.depth += 1
+
+        for st in states:
+            for node in st.collected:
                 expanded.add(node.key)
-                frontier.append(node)
                 self._add(ctx, node, visited)
                 if len(ctx.tokens) >= self.cfg.ctx_size:
                     return
-                for (ptable, prow), col in zip(
-                    node.parents, self.enc.tables[node.table.key].fk_columns
-                ):
-                    # Already expanded: the next level would skip it, so don't fetch it.
-                    if (ptable, prow) in expanded:
-                        continue
-                    nxt.append(
-                        (
-                            self.db.tables[ptable],
-                            prow,
-                            f"parent via {col} of {node.table.key}/{node.row}",
-                        )
-                    )
 
-            next_nodes = self._fetch_parents(ctx, nxt, seed_i, depth + 1, bound)
-            next_nodes += self._fetch_children(
-                ctx, frontier, seed_table, seed_i, depth + 1, bound, target_ts
-            )
-            level = next_nodes
-            depth += 1
+    def _take_level(self, st: "_SeedBfs", target: Node, expanded) -> None:
+        """Claim this seed's rows on its current level, until its local budget is spent."""
+        st.frontier, st.wanted = [], []
+        for node in st.level:
+            if node.key in expanded or node.key in st.seen:
+                continue
+            st.cells += len(node.cells) + (1 if node is target else 0)
+            if st.cells >= self.cfg.local_ctx_size and node is not st.node:
+                st.frontier, st.wanted, st.level = [], [], []
+                return
+            st.seen.add(node.key)
+            st.collected.append(node)
+            st.frontier.append(node)
+            for (ptable, prow), col in zip(
+                node.parents, self.enc.tables[node.table.key].fk_columns
+            ):
+                # Already claimed: the next level would skip it, so don't fetch it.
+                if (ptable, prow) in expanded or (ptable, prow) in st.seen:
+                    continue
+                st.wanted.append(
+                    (
+                        self.db.tables[ptable],
+                        prow,
+                        f"parent via {col} of {node.table.key}/{node.row}",
+                    )
+                )
 
     def _add(self, ctx: Context, node: Node, visited) -> None:
         if node.key in visited:
@@ -272,74 +319,111 @@ class Retriever:
         for ci in range(len(node.cells)):
             ctx.tokens.append((i, ci))
 
-    def _fetch_parents(self, ctx, wanted, seed_i, depth, bound) -> list[Node]:
-        by_table: dict[str, list[tuple[int, str]]] = {}
-        for t, r, via in wanted:
-            by_table.setdefault(t.name, []).append((r, via))
-        out = []
-        for name, items in by_table.items():
-            t = self.db.tables[name]
+    def _fetch_parents(self, ctx, states) -> dict[int, list[Node]]:
+        """Each seed's wanted parents, one query per parent table for the batch."""
+        tables: dict[str, Table] = {}
+        for st in states:
+            for t, _, _ in st.wanted:
+                tables.setdefault(t.name, t)
+        fetched: dict[tuple[str, int, int], tuple] = {}
+        for name, t in tables.items():
+            pids, bounds, seed_is = [], [], []
+            for st in states:
+                for r in sorted({r for pt, r, _ in st.wanted if pt.name == name}):
+                    pids.append(r)
+                    bounds.append(st.node.timestamp)
+                    seed_is.append(st.seed_i)
             ts = _ts_expr(t)
             visible = (
                 "TRUE"
-                if bound is None or ts is None
-                else f"({ts} IS NULL OR {ts} <= {int(bound)})"
+                if ts is None
+                else f"(w.__bound IS NULL OR {ts} IS NULL OR {ts} <= w.__bound)"
             )
-            rows = sorted({r for r, _ in items})
-            fetched = {
-                v[0]: v
-                for v in self._run(
-                    ctx,
-                    f"parents {t.key}",
-                    f"SELECT {self.enc.select_list(t)} FROM {t.sql} "
-                    f"WHERE {ROW} IN (SELECT unnest(?::BIGINT[])) AND {visible}",
-                    [rows],
-                )
-            }
-            for r, via in items:
-                if r in fetched:
-                    out.append(self._node(t, fetched[r], seed_i, depth, via))
+            for v in self._run(
+                ctx,
+                f"parents {t.key}",
+                f"SELECT {self.enc.select_list(t)}, w.__seed FROM {t.sql} "
+                f"JOIN {_WANTED} w ON {ROW} = w.__pid WHERE {visible}",
+                [pids, bounds, seed_is],
+            ):
+                fetched[(name, v[0], v[-1])] = v[:-1]
+        out: dict[int, list[Node]] = {}
+        for st in states:
+            # Grouped by table in this seed's own order, as one seed's BFS was.
+            by_table: dict[str, list[tuple[int, str]]] = {}
+            for t, r, via in st.wanted:
+                by_table.setdefault(t.name, []).append((r, via))
+            nodes = out.setdefault(st.seed_i, [])
+            for name, items in by_table.items():
+                for r, via in items:
+                    v = fetched.get((name, r, st.seed_i))
+                    if v is not None:
+                        nodes.append(
+                            self._node(tables[name], v, st.seed_i, st.depth + 1, via)
+                        )
         return out
 
-    def _fetch_children(
-        self, ctx, frontier, seed_table, seed_i, depth, bound, target_ts
-    ):
-        by_table: dict[str, list[Node]] = {}
-        for node in frontier:
-            if not node.table.is_task:
-                by_table.setdefault(node.table.name, []).append(node)
-        out = []
-        for parent_name, parents in by_table.items():
-            rows = sorted({n.row for n in parents})
+    def _fetch_children(self, ctx, states, target_ts) -> dict[int, list[Node]]:
+        """Up to `bfs_width` children per FK of each seed's frontier, one query per FK."""
+        fetched: dict[tuple[str, str, int], list[tuple]] = {}
+        for parent_name in dict.fromkeys(
+            n.table.name for st in states for n in st.frontier if not n.table.is_task
+        ):
+            pids, bounds, seed_is = [], [], []
+            for st in states:
+                for r in sorted(
+                    {n.row for n in st.frontier if n.table.name == parent_name}
+                ):
+                    pids.append(r)
+                    bounds.append(st.node.timestamp)
+                    seed_is.append(st.seed_i)
+            if not pids:
+                continue
             for child, col in self.db.children_of(parent_name):
                 # As in the sampler: a child is a database row or a row of
-                # the seed's own table.
-                if child.is_task and child.name != seed_table.name:
+                # the seed's own table. Every seed is the target's task.
+                if child.is_task and child.name != states[0].table.name:
                     continue
                 ts = _ts_expr(child)
-                visible = self._visible(ts, child, bound, target_ts)
+                if ts is None:
+                    visible = "TRUE"
+                else:
+                    visible = (
+                        f"(CASE WHEN w.__bound IS NULL THEN {ts} IS NULL "
+                        f"ELSE ({ts} IS NULL OR {ts} <= w.__bound) END)"
+                    )
+                    if child.is_task and target_ts is not None:
+                        visible += f" AND ({ts} IS NULL OR {ts} <> {int(target_ts)})"
                 order = f"{ts} DESC NULLS LAST, {ROW} DESC" if ts else f"{ROW} DESC"
-                fetched = self._run(
+                for v in self._run(
                     ctx,
                     f"children {child.key} via {col}",
-                    f"SELECT {self.enc.select_list(child)}, {ident(col)} AS __parent "
-                    f"FROM {child.sql} "
-                    f"WHERE {ident(col)} IN (SELECT unnest(?::BIGINT[])) AND {visible} "
-                    f"QUALIFY row_number() OVER (PARTITION BY {ident(col)} ORDER BY {order}) "
-                    f"<= {self.cfg.bfs_width} "
+                    f"SELECT {self.enc.select_list(child)}, {ident(col)} AS __parent, "
+                    f"w.__seed FROM {child.sql} "
+                    f"JOIN {_WANTED} w ON {ident(col)} = w.__pid WHERE {visible} "
+                    f"QUALIFY row_number() OVER (PARTITION BY w.__seed, {ident(col)} "
+                    f"ORDER BY {order}) <= {self.cfg.bfs_width} "
                     # Without it, DuckDB's parallel scan returns rows in any order.
-                    f"ORDER BY {ident(col)}, {order}",
-                    [rows],
-                )
-                for values in fetched:
-                    parent_row = values[-1]
-                    out.append(
-                        self._node(
-                            child,
-                            values[:-1],
-                            seed_i,
-                            depth,
-                            f"child via {col} of {parent_name}/{parent_row}",
+                    f"ORDER BY w.__seed, {ident(col)}, {order}",
+                    [pids, bounds, seed_is],
+                ):
+                    fetched.setdefault((child.key, col, v[-1]), []).append(v[:-1])
+        out: dict[int, list[Node]] = {}
+        for st in states:
+            # Parent tables in this seed's own frontier order, as one seed's BFS was.
+            nodes = out.setdefault(st.seed_i, [])
+            for parent_name in dict.fromkeys(
+                n.table.name for n in st.frontier if not n.table.is_task
+            ):
+                for child, col in self.db.children_of(parent_name):
+                    for v in fetched.get((child.key, col, st.seed_i), []):
+                        nodes.append(
+                            self._node(
+                                child,
+                                v[:-1],
+                                st.seed_i,
+                                st.depth + 1,
+                                f"child via {col} of {parent_name}/{v[-1]}",
+                            )
                         )
-                    )
         return out
