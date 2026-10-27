@@ -30,10 +30,22 @@ that reached it (`target`, `example`, `parent via <fk> of <row>`,
 python -m examples.sql.parity --duckdb mini-shop.duckdb --pre-dir pre \
     --task customer-churn --rows 32 [--model]
 
-# predict a task from the database alone, with traces; --pre-dir adds the sampler baseline
+# predict a task from the database alone, with traces
 python -m examples.sql.predict --duckdb mini-shop.duckdb --task customer-churn \
-    --rows 64 --ctx-size 512 --trace traces.jsonl [--pre-dir pre]
+    --rows 64 --ctx-size 512 --trace traces.jsonl
+
+# score a whole test split with RelBench, comparable with examples/eval
+python -m examples.sql.predict --duckdb data/relbench-duckdb/rel-f1.duckdb \
+    --task driver-dnf --all-rows --ctx-size 8192 \
+    --relbench data/relbench-v1/rel-f1 --csv-out sql_out/
 ```
+
+With `--relbench`, predictions go through `relbench.submit.evaluate_task`, the
+scoring `rt.eval` uses, and `--csv-out` keeps the submission CSV
+(`<db>__<task>.csv`, the same name and columns as `rt.eval`'s `eval_out/`).
+Only a full split is a submission; a sample is scored with sklearn and marked
+`~`. The sampler baseline is `examples/eval` on the same task; the two CSVs
+join on the entity and time columns.
 
 Off CUDA, both scripts run flex attention uncompiled, because `torch.compile`
 cannot lower it for CPU on macOS. That is slow but gives the same numbers.

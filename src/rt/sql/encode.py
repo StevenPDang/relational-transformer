@@ -188,9 +188,7 @@ class Encoder:
         for col, sql_type in columns:
             kind = kind_of(sql_type)
             c = ident(col)
-            if kind == "bool":
-                x = f"{c}::DOUBLE"
-            elif kind == "number":
+            if kind in ("bool", "number"):
                 x = f"{c}::DOUBLE"
             elif kind == "float":
                 x = f"CASE WHEN isnan({c}) THEN NULL ELSE {c}::DOUBLE END"

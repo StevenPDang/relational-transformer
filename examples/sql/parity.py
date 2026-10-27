@@ -14,6 +14,7 @@ The pre dir must come from this checkout's `preprocess` of the same data.
 
 import argparse
 import json
+import math
 from collections import Counter
 from pathlib import Path
 
@@ -118,7 +119,7 @@ def replay(con, db, enc, loc: Locator, batch, b: int, target_column: str) -> Con
         parents = [
             (t.fkeys[col], int(v))
             for col, v in zip(enc_t.fk_columns, fks)
-            if v is not None and v == v
+            if v is not None and not (isinstance(v, float) and math.isnan(v))
         ]
         nodes.append(Node(t, row, parents, cells, ts, 0, 0, "replay"))
 
@@ -182,8 +183,8 @@ def compare(a, b, nodes, cols_a, cols_b) -> Counter:
 def load_model(device: str):
     """RT-J for `device`. Off CUDA, flex attention runs uncompiled: rt compiles
     it at import, and torch.compile cannot lower it for CPU on macOS."""
-    import rt.model.net as net
     from rt import RelationalTransformer
+    from rt.model import net
 
     if not device.startswith("cuda"):
         from torch.nn.attention.flex_attention import flex_attention

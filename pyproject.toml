@@ -70,6 +70,10 @@ ruff = "*"
 
 [tool.pixi.pypi-dependencies]
 relational-transformer = { path = ".", editable = true }
+# CUDA 12.4 build, for drivers that predate newer CUDA wheels. 2.6.0 is the last
+# release on the cu124 index and the first with the torch.nn.utils
+# get_total_norm / clip_grads_with_norm_ that rt.train calls.
+torch = { version = "==2.6.0", index = "https://download.pytorch.org/whl/cu124" }
 # The DuckDB release rustler's duckdb crate bundles (1.10506.x), so files
 # examples/preprocess/to_duckdb.py writes open on the Rust side.
 duckdb = "==1.5.6"

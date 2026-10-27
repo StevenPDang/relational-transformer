@@ -20,6 +20,7 @@ Each step is one query per table or FK over the whole BFS level, never one
 query per row.
 """
 
+import math
 import time
 from dataclasses import dataclass
 
@@ -74,7 +75,7 @@ class Retriever:
         parents = [
             (t.fkeys[col], int(v))
             for col, v in zip(enc.fk_columns, fks)
-            if v is not None and v == v  # skip null and NaN
+            if v is not None and not (isinstance(v, float) and math.isnan(v))
         ]
         return Node(t, row, parents, cells, ts, seed, depth, via)
 
