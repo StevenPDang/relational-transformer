@@ -44,6 +44,15 @@ def literal(s: str) -> str:
     return "'" + s.replace("'", "''") + "'"
 
 
+def key_columns(con, table: str) -> set[str]:
+    """Columns a key can be read from: not lists (a recommendation task's targets)."""
+    return {
+        name
+        for name, type_, *_ in con.execute(f"DESCRIBE {table}").fetchall()
+        if not type_.endswith("]")
+    }
+
+
 def load_parquet(con, table: str, path: Path, fkeys: list[str], index: bool) -> int:
     con.execute(
         f"CREATE TABLE {table} AS "
@@ -54,7 +63,7 @@ def load_parquet(con, table: str, path: Path, fkeys: list[str], index: bool) -> 
     if index:
         flat = table.replace('"', "").replace(".", "_")
         con.execute(f"CREATE INDEX {ident(f'idx_{flat}___row')} ON {table} (__row)")
-        columns = {r[0] for r in con.execute(f"DESCRIBE {table}").fetchall()}
+        columns = key_columns(con, table)
         for col in fkeys:
             if col in columns:
                 con.execute(
@@ -69,7 +78,7 @@ FK_SCHEMA = '"__by_fk"'
 def fk_sorted_copy(con, table: str, key: str, col: str, time_col: str | None) -> None:
     """A copy of `table` sorted by FK `col`, newest first within each value."""
     columns = {r[0] for r in con.execute(f"DESCRIBE {table}").fetchall()}
-    if col not in columns:
+    if col not in key_columns(con, table):
         return
     order = [ident(col)]
     if time_col and time_col in columns:
