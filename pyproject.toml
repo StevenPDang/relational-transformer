@@ -61,7 +61,7 @@ scripts = ["activate.sh"]
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER = "x86_64-conda-linux-gnu-cc"
 
 [tool.pixi.dependencies]
-python = "*"
+python = "3.12.*"
 rust = "*"
 maturin = "*"
 uv = "*"
