@@ -244,6 +244,9 @@ class Retriever:
                 for (ptable, prow), col in zip(
                     node.parents, self.enc.tables[node.table.key].fk_columns
                 ):
+                    # Already expanded: the next level would skip it, so don't fetch it.
+                    if (ptable, prow) in expanded:
+                        continue
                     nxt.append(
                         (
                             self.db.tables[ptable],
@@ -323,7 +326,9 @@ class Retriever:
                     f"FROM {child.sql} "
                     f"WHERE {ident(col)} IN (SELECT unnest(?::BIGINT[])) AND {visible} "
                     f"QUALIFY row_number() OVER (PARTITION BY {ident(col)} ORDER BY {order}) "
-                    f"<= {self.cfg.bfs_width}",
+                    f"<= {self.cfg.bfs_width} "
+                    # Without it, DuckDB's parallel scan returns rows in any order.
+                    f"ORDER BY {ident(col)}, {order}",
                     [rows],
                 )
                 for values in fetched:
