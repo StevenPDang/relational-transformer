@@ -23,6 +23,13 @@ Every context is traceable: `Context.trace()` lists each row with the step
 that reached it (`target`, `example`, `parent via <fk> of <row>`,
 `child via <fk> of <row>`) and every query with its row count and time.
 
+To watch the queries live, `predict --query-log DIR` turns on DuckDB's own
+query log, which writes each statement as it runs (parameters show as `?`):
+
+```
+tail -f DIR/duckdb_log_entries.csv
+```
+
 ## Scripts
 
 ```

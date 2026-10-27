@@ -126,6 +126,11 @@ def main():
         "or a Hub spec (stanford-star/relbench-v1/rel-f1)",
     )
     p.add_argument("--csv-out", help="directory for the RelBench submission CSV")
+    p.add_argument(
+        "--query-log",
+        help="directory for DuckDB's query log, written as each query runs "
+        "(tail -f <dir>/duckdb_log_entries.csv)",
+    )
     args = p.parse_args()
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise SystemExit("--device cuda, but torch.cuda.is_available() is False")
@@ -135,6 +140,12 @@ def main():
 
     tic = time.perf_counter()
     con = duckdb.connect(args.duckdb, read_only=True)
+    if args.query_log:
+        log_dir = str(Path(args.query_log).resolve()).replace("'", "''")
+        con.execute(
+            f"CALL enable_logging('QueryLog', storage='file', storage_path='{log_dir}')"
+        )
+        print(f"query log -> {Path(args.query_log) / 'duckdb_log_entries.csv'}")
     db = rs.load(con)
     enc = rs.Encoder(con, db)
     task = db.tasks[args.task]
