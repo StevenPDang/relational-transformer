@@ -164,6 +164,7 @@ def main():
     model = load_model(args.device)
 
     if args.trace:
+        Path(args.trace).parent.mkdir(parents=True, exist_ok=True)
         Path(args.trace).write_text("")
     t_retrieve = t_encode = t_model = 0.0
     preds, raw_labels, q, toks = [], [], [], []

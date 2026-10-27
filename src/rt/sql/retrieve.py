@@ -11,10 +11,11 @@ made deterministic so a context can be replayed and traced:
    `local_ctx_size` cells: every parent through every FK, and up to
    `bfs_width` children per FK, most recent first. (The sampler draws the
    children at random.)
-3. Time. Nothing stamped after the target is read, and no other task row
-   stamped at the target's own time (it would be a label from the same
-   horizon). With an untimestamped target, only untimestamped children are
-   read, as in the sampler.
+3. Time. Each seed's neighbourhood holds nothing stamped after that seed
+   (for the target, after the target), and no other task row stamped at the
+   target's own time (it would be a label from the same horizon). With an
+   untimestamped seed, only untimestamped children are read, as in the
+   sampler.
 
 Each step is one query per table or FK over the whole BFS level, never one
 query per row.
@@ -218,7 +219,9 @@ class Retriever:
 
     def _expand(self, ctx, seed_i, seed_table, seed_node, target, visited, expanded):
         """Breadth-first expansion of one seed, appending its rows' cells."""
-        bound = target.timestamp
+        # As in the sampler: a seed's neighbourhood is read as of the seed's own
+        # time, so an example's rows match what was known when its label was set.
+        bound = seed_node.timestamp
         target_ts = target.timestamp
         seed_node.seed = seed_i
         level = [seed_node]
