@@ -20,7 +20,9 @@ scored by RelBench itself (`relbench.submit.evaluate_task`), the same scoring
 import argparse
 import json
 import random
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import duckdb
@@ -119,6 +121,12 @@ def main():
     )
     p.add_argument("--bs", type=int, default=8)
     p.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="contexts retrieved at once, each on its own DuckDB cursor",
+    )
+    p.add_argument(
         "--chunk", type=int, default=16, help="contexts built and predicted at once"
     )
     p.add_argument("--seed", type=int, default=0, help="seeds the row sample")
@@ -167,36 +175,48 @@ def main():
         rows = sorted(
             random.Random(args.seed).sample(range(n_rows), min(args.rows, n_rows))
         )
-    retriever = rs.Retriever(
-        con,
-        db,
-        enc,
-        rs.RetrieveConfig(
-            ctx_size=args.ctx_size,
-            local_ctx_size=args.local_ctx_size,
-            bfs_width=args.bfs_width,
-            seed_batch=args.seed_batch,
-        ),
+    config = rs.RetrieveConfig(
+        ctx_size=args.ctx_size,
+        local_ctx_size=args.local_ctx_size,
+        bfs_width=args.bfs_width,
+        seed_batch=args.seed_batch,
     )
+    # One retriever per worker thread, each on its own cursor: a DuckDB
+    # connection runs one query at a time, and contexts are independent.
+    local = threading.local()
+
+    def build(r):
+        if not hasattr(local, "retriever"):
+            local.retriever = rs.Retriever(con.cursor(), db, enc, config)
+        tic = time.perf_counter()
+        ctx = local.retriever.build(args.task, args.split, r)
+        return ctx, time.perf_counter() - tic
+
     embed = rs.TextEmbedder(args.embedder, args.device)
     model = load_model(args.device)
 
     if args.trace:
         Path(args.trace).parent.mkdir(parents=True, exist_ok=True)
         Path(args.trace).write_text("")
-    t_retrieve = t_encode = t_model = 0.0
+    t_retrieve = t_wait = t_encode = t_model = 0.0
     preds, raw_labels, q, toks = [], [], [], []
     bar = tqdm(total=len(rows), unit="row", desc=f"{args.task}")
     # In chunks: a full context batch holds two d_text vectors per token.
-    for i in range(0, len(rows), args.chunk):
+    # The next chunk is retrieved in the background while this one runs the model.
+    chunks = [rows[i : i + args.chunk] for i in range(0, len(rows), args.chunk)]
+    pool = ThreadPoolExecutor(max_workers=args.workers)
+    t_start = time.perf_counter()
+    pending = [pool.submit(build, r) for r in chunks[0]] if chunks else []
+    for k in range(len(chunks)):
+        bar.set_postfix_str("retrieve")
         tic = time.perf_counter()
-        contexts = []
-        chunk = rows[i : i + args.chunk]
-        for r in chunk:
-            bar.set_postfix_str(f"retrieve {len(contexts) + 1}/{len(chunk)}")
-            contexts.append(retriever.build(args.task, args.split, r))
+        built = [f.result() for f in pending]
+        t_wait += time.perf_counter() - tic
+        if k + 1 < len(chunks):
+            pending = [pool.submit(build, r) for r in chunks[k + 1]]
+        contexts = [c for c, _ in built]
+        t_retrieve += sum(dt for _, dt in built)
         bar.set_postfix_str("encode")
-        t_retrieve += time.perf_counter() - tic
         tic = time.perf_counter()
         batch = rs.to_batch(contexts, embed, args.ctx_size, args.d_text)
         t_encode += time.perf_counter() - tic
@@ -217,6 +237,8 @@ def main():
                 )
         bar.update(len(contexts))
     bar.close()
+    pool.shutdown()
+    t_wall = time.perf_counter() - t_start
 
     if task.task_type == "binary_classification":
         labels = raw_labels
@@ -241,11 +263,15 @@ def main():
         f"  setup {t_setup * 1e3:.0f} ms (schema + column statistics, once per database)"
     )
     print(
-        f"  retrieve {t_retrieve / n * 1e3:.1f} ms/context "
+        f"  retrieve {t_retrieve / n * 1e3:.1f} ms/context per worker "
         f"({np.mean(q):.0f} queries, {np.mean(toks):.0f} tokens on average)"
     )
     print(f"  encode   {t_encode / n * 1e3:.1f} ms/context (incl. text embedding)")
     print(f"  model    {t_model / n * 1e3:.1f} ms/context ({args.device})")
+    print(
+        f"  wall     {t_wall / n * 1e3:.1f} ms/context with {args.workers} workers "
+        f"({t_wait / n * 1e3:.1f} ms/context waiting on retrieval)"
+    )
     if args.trace:
         print(f"  traces -> {args.trace}")
 
