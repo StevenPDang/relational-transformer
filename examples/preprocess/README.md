@@ -80,3 +80,17 @@ one(dataset="stanford-star/relbench-v1/rel-f1", out_dir="data/relbench-preproces
 rustler; `upload_repo` pushes the result to the Hub. `rt.preprocess.many`
 takes a Hub repo of databases and does shard `shard` of `num_shards`, skipping
 finished ones; `rt.preprocess.ls` lists the repo.
+
+## To DuckDB
+
+`to_duckdb.py` turns a RelBench-format database, or a directory of them, into
+one `<name>.duckdb` each:
+
+```
+pixi run python -m examples.preprocess.to_duckdb data/relbench-v1 --out-dir data/relbench-duckdb
+```
+
+Database tables keep their names, and task splits become `"<task>".<split>`.
+Every table gains `__row`, its parquet row position, which is what RelBench
+keys refer to. `__row` and each foreign key column are indexed, and the
+manifests are stored in `_rt_manifest`. The script's docstring has the details.

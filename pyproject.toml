@@ -70,6 +70,9 @@ ruff = "*"
 
 [tool.pixi.pypi-dependencies]
 relational-transformer = { path = ".", editable = true }
+# The DuckDB release rustler's duckdb crate bundles (1.10506.x), so files
+# examples/preprocess/to_duckdb.py writes open on the Rust side.
+duckdb = "==1.5.6"
 relbench = { git = "https://github.com/stanford-star/relbench", rev = "bac62c99cf1a60fbfd7c61c5fd7cb183453b7997" }
 roach = { git = "https://github.com/rishabh-ranjan/roach", branch = "main" }
 
