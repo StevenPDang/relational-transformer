@@ -53,3 +53,7 @@ half = { version = "2.5", features = ["rkyv"] }
 rayon = "1.10"
 dashmap = "6.1"
 faiss = { version = "0.13", features = ["static"], optional = true }
+# duckdb-rs puts the DuckDB release in its minor (1.10506.x is DuckDB 1.5.6),
+# so the major alone would float onto a different DuckDB; `~` holds the
+# release. `bundled` compiles DuckDB from source, so no system libduckdb.
+duckdb = { version = "~1.10506.0", features = ["bundled"] }

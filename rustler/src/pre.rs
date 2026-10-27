@@ -39,21 +39,21 @@ struct Table {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TableSpec {
+pub(crate) struct TableSpec {
     #[serde(default)]
     pkey: Option<String>,
     #[serde(default)]
-    time_col: Option<String>,
+    pub(crate) time_col: Option<String>,
     #[serde(default)]
-    fkeys: HashMap<String, String>,
+    pub(crate) fkeys: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DatasetManifest {
+pub(crate) struct DatasetManifest {
     name: String,
     #[serde(default)]
-    tables: HashMap<String, TableSpec>,
+    pub(crate) tables: HashMap<String, TableSpec>,
 
     #[serde(default)]
     #[allow(dead_code)]
@@ -70,7 +70,7 @@ struct DatasetManifest {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TaskManifest {
+pub(crate) struct TaskManifest {
     #[serde(default)]
     kind: Option<String>,
     #[serde(default)]
@@ -82,7 +82,7 @@ struct TaskManifest {
     #[serde(default)]
     task_type: Option<String>,
     #[serde(default)]
-    time_col: Option<String>,
+    pub(crate) time_col: Option<String>,
     #[serde(default)]
     src_entity_table: Option<String>,
     #[serde(default)]
@@ -119,7 +119,7 @@ struct TaskManifest {
 }
 
 impl TaskManifest {
-    fn fkeys(&self) -> HashMap<String, String> {
+    pub(crate) fn fkeys(&self) -> HashMap<String, String> {
         let mut m = HashMap::new();
         for (col, table) in [
             (&self.entity_col, &self.entity_table),
@@ -134,7 +134,7 @@ impl TaskManifest {
     }
 }
 
-fn load_yaml<T: serde::de::DeserializeOwned>(path: &Path) -> T {
+pub(crate) fn load_yaml<T: serde::de::DeserializeOwned>(path: &Path) -> T {
     let s = fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e));
     serde_yaml::from_str(&s)

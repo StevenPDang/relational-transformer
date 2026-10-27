@@ -1,6 +1,6 @@
 use crate::common::{
     ArchivedAdj, ArchivedEdge, ArchivedNode, ArchivedOffsets, ArchivedSemType, ArchivedTableType,
-    Offsets, SemType, TableInfo,
+    Edge, Offsets, SemType, TableInfo, TableType,
 };
 use clap::Parser;
 #[cfg(feature = "vecdb")]
@@ -31,6 +31,8 @@ use std::str;
 #[cfg(feature = "vecdb")]
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+pub mod sql_edges;
 
 unsafe fn alloc_zeroed_vec<T>(len: usize) -> Vec<T> {
     if len == 0 {
@@ -297,6 +299,9 @@ struct Dataset {
     p2f_adj_mmap: Mmap,
     offsets: Vec<i64>,
     table_info: HashMap<String, TableInfo>,
+    // When set, sampling reads FK edges from DuckDB instead of `nodes.rkyv`
+    // and `p2f_adj.rkyv`.
+    sql_edges: Option<sql_edges::SqlEdges>,
 
     #[cfg(feature = "vecdb")]
     vector_db: Option<HashMap<String, VectorDbEntry>>,
@@ -833,6 +838,7 @@ impl Sampler {
                 p2f_adj_mmap,
                 offsets,
                 table_info,
+                sql_edges: None,
                 #[cfg(feature = "vecdb")]
                 vector_db,
             },
@@ -1441,6 +1447,23 @@ impl Sampler {
         target_ts: Option<i32>,
         rng: &mut StdRng,
     ) -> Option<i32> {
+        if let Some(sql) = &dataset.sql_edges {
+            // Same draw as below: uniform over visible parents then children,
+            // where with no bound every neighbor is visible.
+            let f2p_edges = sql.f2p_edges(current_idx, bound);
+            let p2f_edges = sql.p2f_edges(current_idx, bound, bound.and(target_ts));
+            let total_valid_neighbors = f2p_edges.len() + p2f_edges.len();
+            if total_valid_neighbors == 0 {
+                return None;
+            }
+            let rand_idx = rng.random_range(0..total_valid_neighbors);
+            return Some(if rand_idx < f2p_edges.len() {
+                f2p_edges[rand_idx].node_idx
+            } else {
+                p2f_edges[rand_idx - f2p_edges.len()].node_idx
+            });
+        }
+
         let current_node = get_node(dataset, current_idx);
         let p2f_edges = get_p2f_edges(dataset, current_idx);
 
@@ -1456,7 +1479,7 @@ impl Sampler {
         let valid_f2p_count = if bound.is_some() {
             f2p_edges
                 .iter()
-                .filter(|edge| edge_visible(edge, bound, target_ts))
+                .filter(|edge| edge_visible(*edge, bound, target_ts))
                 .count()
         } else {
             f2p_edges.len()
@@ -1472,7 +1495,7 @@ impl Sampler {
             Some(
                 f2p_edges
                     .iter()
-                    .filter(|edge| edge_visible(edge, bound, target_ts))
+                    .filter(|edge| edge_visible(*edge, bound, target_ts))
                     .nth(rand_idx)
                     .unwrap()
                     .node_idx
@@ -1614,60 +1637,43 @@ impl Sampler {
 
             result.push((node_idx, depth));
 
-            for edge in node.f2p_edges.iter() {
-                if !edge_visible(edge, bound, target_ts) {
-                    continue;
+            let start_table = i32::from(start_node.table_name_idx);
+            let chosen = if let Some(sql) = &dataset.sql_edges {
+                for edge in sql.f2p_edges(node_idx, bound) {
+                    f2p_ftr.push((depth + 1, edge.node_idx));
                 }
-                f2p_ftr.push((depth + 1, edge.node_idx.into()));
-            }
-
-            let p2f_edges = get_p2f_edges(dataset, node_idx);
-
-            let valid_edges = if bound.is_some() {
-                p2f_edges
-                    .as_slice()
-                    .partition_point(|edge| edge_visible(edge, bound, target_ts))
+                let p2f_edges = match bound {
+                    Some(_) => sql.p2f_edges(node_idx, bound, target_ts),
+                    None => {
+                        let mut edges = sql.p2f_edges(node_idx, None, None);
+                        edges.retain(|edge| edge.timestamp.is_none());
+                        edges
+                    }
+                };
+                sample_p2f(&p2f_edges, start_table, bfs_width, rng, deadline)
             } else {
-                p2f_edges
-                    .as_slice()
-                    .partition_point(|edge| edge.timestamp.is_none())
-            };
+                for edge in node.f2p_edges.iter() {
+                    if !edge_visible(edge, bound, target_ts) {
+                        continue;
+                    }
+                    f2p_ftr.push((depth + 1, edge.node_idx.into()));
+                }
 
-            let p2f_edges = &p2f_edges.as_slice()[..valid_edges];
+                let p2f_edges = get_p2f_edges(dataset, node_idx);
 
-            let eligible = |edge: &ArchivedEdge| {
-                edge.table_type == ArchivedTableType::Db
-                    || edge.table_name_idx == start_node.table_name_idx
-            };
-            let n = p2f_edges.len();
-            let mut chosen: Vec<i32> = Vec::with_capacity(bfs_width.min(n));
-
-            if n <= bfs_width {
-                chosen.extend(
+                let valid_edges = if bound.is_some() {
                     p2f_edges
-                        .iter()
-                        .filter(|e| eligible(e))
-                        .map(|e| i32::from(e.node_idx)),
-                );
-            } else {
-                let budget = (DRAW_BUDGET * bfs_width).min(n);
-                let mut swapped: HashMap<usize, usize> = HashMap::with_capacity(budget);
-                for j in 0..budget {
-                    if chosen.len() == bfs_width {
-                        break;
-                    }
-                    if j & (DEADLINE_CHECK_EVERY - 1) == 0 {
-                        check_deadline(deadline);
-                    }
-                    let r = rng.random_range(j..n);
-                    let pick = *swapped.get(&r).unwrap_or(&r);
-                    let at_j = *swapped.get(&j).unwrap_or(&j);
-                    swapped.insert(r, at_j);
-                    if eligible(&p2f_edges[pick]) {
-                        chosen.push(p2f_edges[pick].node_idx.into());
-                    }
-                }
-            }
+                        .as_slice()
+                        .partition_point(|edge| edge_visible(edge, bound, target_ts))
+                } else {
+                    p2f_edges
+                        .as_slice()
+                        .partition_point(|edge| edge.timestamp.is_none())
+                };
+
+                let p2f_edges = &p2f_edges.as_slice()[..valid_edges];
+                sample_p2f(p2f_edges, start_table, bfs_width, rng, deadline)
+            };
 
             for &node_idx in chosen.iter() {
                 if depth + 1 >= p2f_ftr.len() {
@@ -1679,6 +1685,44 @@ impl Sampler {
             }
         }
     }
+}
+
+// Up to `bfs_width` children for the BFS frontier, drawn without replacement
+// from `edges`. A child is eligible when it is a database row or a row of the
+// seed's own table.
+fn sample_p2f<E: EdgeRef>(
+    edges: &[E],
+    start_table: i32,
+    bfs_width: usize,
+    rng: &mut StdRng,
+    deadline: Instant,
+) -> Vec<i32> {
+    let eligible = |edge: &E| edge.is_db() || edge.table_name_idx() == start_table;
+    let n = edges.len();
+    let mut chosen: Vec<i32> = Vec::with_capacity(bfs_width.min(n));
+
+    if n <= bfs_width {
+        chosen.extend(edges.iter().filter(|e| eligible(e)).map(|e| e.node_idx()));
+    } else {
+        let budget = (DRAW_BUDGET * bfs_width).min(n);
+        let mut swapped: HashMap<usize, usize> = HashMap::with_capacity(budget);
+        for j in 0..budget {
+            if chosen.len() == bfs_width {
+                break;
+            }
+            if j & (DEADLINE_CHECK_EVERY - 1) == 0 {
+                check_deadline(deadline);
+            }
+            let r = rng.random_range(j..n);
+            let pick = *swapped.get(&r).unwrap_or(&r);
+            let at_j = *swapped.get(&j).unwrap_or(&j);
+            swapped.insert(r, at_j);
+            if eligible(&edges[pick]) {
+                chosen.push(edges[pick].node_idx());
+            }
+        }
+    }
+    chosen
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1883,15 +1927,54 @@ fn temporal_bound(target_ts: Option<i32>, cutoff: Option<i32>) -> Option<i32> {
     }
 }
 
-fn edge_same_horizon_task(edge: &ArchivedEdge, target_ts: Option<i32>) -> bool {
-    edge.table_type != ArchivedTableType::Db
-        && match (edge.timestamp.as_ref(), target_ts) {
-            (Some(ts), Some(t)) => i32::from(*ts) == t,
+// The edge fields sampling reads, over both edge sources: the archived edges
+// mapped from the preprocessed files, and the owned edges `SqlEdges` returns.
+trait EdgeRef {
+    fn node_idx(&self) -> i32;
+    fn table_name_idx(&self) -> i32;
+    fn is_db(&self) -> bool;
+    fn timestamp(&self) -> Option<i32>;
+}
+
+impl EdgeRef for ArchivedEdge {
+    fn node_idx(&self) -> i32 {
+        self.node_idx.into()
+    }
+    fn table_name_idx(&self) -> i32 {
+        self.table_name_idx.into()
+    }
+    fn is_db(&self) -> bool {
+        self.table_type == ArchivedTableType::Db
+    }
+    fn timestamp(&self) -> Option<i32> {
+        self.timestamp.as_ref().map(|ts| (*ts).into())
+    }
+}
+
+impl EdgeRef for Edge {
+    fn node_idx(&self) -> i32 {
+        self.node_idx
+    }
+    fn table_name_idx(&self) -> i32 {
+        self.table_name_idx
+    }
+    fn is_db(&self) -> bool {
+        self.table_type == TableType::Db
+    }
+    fn timestamp(&self) -> Option<i32> {
+        self.timestamp
+    }
+}
+
+fn edge_same_horizon_task<E: EdgeRef>(edge: &E, target_ts: Option<i32>) -> bool {
+    !edge.is_db()
+        && match (edge.timestamp(), target_ts) {
+            (Some(ts), Some(t)) => ts == t,
             _ => false,
         }
 }
 
-fn edge_visible(edge: &ArchivedEdge, bound: Option<i32>, target_ts: Option<i32>) -> bool {
+fn edge_visible<E: EdgeRef>(edge: &E, bound: Option<i32>, target_ts: Option<i32>) -> bool {
     !edge_past_bound(edge, bound) && !edge_same_horizon_task(edge, target_ts)
 }
 
@@ -1906,9 +1989,9 @@ fn past_bound(node: &ArchivedNode, bound: Option<i32>) -> bool {
     }
 }
 
-fn edge_past_bound(edge: &ArchivedEdge, bound: Option<i32>) -> bool {
-    match (edge.timestamp.as_ref(), bound) {
-        (Some(ts), Some(b)) => i32::from(*ts) > b,
+fn edge_past_bound<E: EdgeRef>(edge: &E, bound: Option<i32>) -> bool {
+    match (edge.timestamp(), bound) {
+        (Some(ts), Some(b)) => ts > b,
         _ => false,
     }
 }
@@ -1975,6 +2058,21 @@ pub struct Cli {
     db_name: String,
     #[arg(long)]
     pre_dir: String,
+    /// Task (or database table) whose rows seed the contexts.
+    #[arg(long)]
+    task: String,
+    #[arg(long, default_value = "Train")]
+    split: String,
+    /// Target column of `--task`, as named in its parquet.
+    #[arg(long)]
+    target_col: String,
+    /// Raw dataset directory (the one given to `preprocess`). When set, FK
+    /// edges come from DuckDB queries over it instead of the preprocessed
+    /// adjacency.
+    #[arg(long)]
+    sql_dataset_dir: Option<String>,
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
     #[arg(default_value = "128")]
     bs: usize,
     #[arg(default_value = "1024")]
@@ -1984,9 +2082,32 @@ pub struct Cli {
 }
 
 pub fn main(cli: Cli) {
+    let pre_path = format!("{}/{}", cli.pre_dir, cli.db_name);
+    let table_info: HashMap<String, TableInfo> = serde_json::from_reader(BufReader::new(
+        fs::File::open(format!("{}/table_info.json", pre_path)).unwrap(),
+    ))
+    .unwrap();
+    let info = table_info
+        .get(&format!("{}:Db", cli.task))
+        .or_else(|| table_info.get(&format!("{}:{}", cli.task, cli.split)))
+        .unwrap_or_else(|| panic!("{} has no {} split", cli.task, cli.split));
+    let column_index: HashMap<String, i32> = serde_json::from_reader(BufReader::new(
+        fs::File::open(format!("{}/column_index.json", pre_path)).unwrap(),
+    ))
+    .unwrap();
+    let target_col = format!("{} of {}", cli.target_col, cli.task);
+    let target_idx = *column_index
+        .get(&target_col)
+        .unwrap_or_else(|| panic!("no column {:?} in column_index.json", target_col));
+
     let tic = Instant::now();
-    let sampler = Sampler::new_impl(
-        vec![(cli.db_name.clone(), String::new(), 0, 100000)],
+    let mut sampler = Sampler::new_impl(
+        vec![(
+            cli.db_name.clone(),
+            cli.task.clone(),
+            info.node_idx_offset,
+            info.num_nodes,
+        )],
         0,
         0,
         1,
@@ -1999,9 +2120,9 @@ pub fn main(cli: Cli) {
         "all-MiniLM-L12-v2",
         cli.pre_dir.clone(),
         384,
-        0,
-        0,
-        vec![0_i32],
+        cli.seed,
+        cli.seed,
+        vec![target_idx],
         vec![Vec::<i32>::new()],
         vec![None],
         -1,
@@ -2015,18 +2136,43 @@ pub fn main(cli: Cli) {
     );
     println!("Sampler loaded in {:?}", tic.elapsed());
 
-    let mut sum = 0;
-    let mut sum_sq = 0;
-    let mut rng = rand::rng();
+    if let Some(dataset_dir) = &cli.sql_dataset_dir {
+        let tic = Instant::now();
+        let edges = sql_edges::SqlEdges::load(dataset_dir, &pre_path);
+        sampler.datasets.get_mut(&cli.db_name).unwrap().sql_edges = Some(edges);
+        println!("SQL edges loaded in {:?}", tic.elapsed());
+    }
+    let source = if cli.sql_dataset_dir.is_some() {
+        "duckdb"
+    } else {
+        "rkyv"
+    };
+
+    let mut times: Vec<f64> = Vec::with_capacity(cli.num_trials);
+    let mut tokens = 0usize;
+    let mut rng = StdRng::seed_from_u64(cli.seed);
     for _ in 0..cli.num_trials {
         let tic = Instant::now();
         let batch_idx = rng.random_range(0..sampler.len(cli.bs));
-        let _vecs = sampler.batch(Some(batch_idx), 0, cli.bs, cli.seq_len);
-        let elapsed = tic.elapsed().as_millis();
-        sum += elapsed;
-        sum_sq += elapsed * elapsed;
+        let vecs = sampler.batch(Some(batch_idx), 0, cli.bs, cli.seq_len);
+        times.push(tic.elapsed().as_secs_f64() * 1e3);
+        tokens += vecs.is_padding.iter().filter(|p| !**p).count();
     }
-    let mean = sum as f64 / cli.num_trials as f64;
-    let std = (sum_sq as f64 / cli.num_trials as f64 - mean * mean).sqrt();
-    println!("Mean: {} ms,\tStd: {} ms", mean, std);
+    times.sort_by(f64::total_cmp);
+    let mean = times.iter().sum::<f64>() / times.len() as f64;
+    let std = (times.iter().map(|t| (t - mean).powi(2)).sum::<f64>() / times.len() as f64).sqrt();
+    let pct = |q: f64| times[((times.len() - 1) as f64 * q).round() as usize];
+    println!(
+        "edges={} batches={} bs={} seq_len={}: mean {:.2} ms, std {:.2} ms, \
+         p50 {:.2} ms, p95 {:.2} ms, {:.1} tokens/context",
+        source,
+        cli.num_trials,
+        cli.bs,
+        cli.seq_len,
+        mean,
+        std,
+        pct(0.5),
+        pct(0.95),
+        tokens as f64 / (cli.num_trials * cli.bs) as f64,
+    );
 }
