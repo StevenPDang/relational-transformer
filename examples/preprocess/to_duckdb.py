@@ -15,7 +15,14 @@ of them (a directory of such directories). Each database becomes one
   key joins to, and it is the node order `preprocess` assigns;
 - `__row` and every foreign key column get an index, for point lookups;
 - `_rt_manifest` holds the database and task manifests as JSON, so the file
-  stands without the source directory.
+  stands without the source directory;
+- with `--fk-sorted`, every table with foreign keys also gets one copy per FK,
+  `"__by_fk"."<table>:<fk>"` (`<table>` is `results` or `<task>/<split>`),
+  sorted by that FK and then newest first. DuckDB keeps min/max statistics
+  per block of rows, so a lookup of a few FK values in a sorted copy skips
+  the blocks that cannot hold them; `rt.sql` reads a copy for children
+  lookups whenever it exists. The cost is one more copy of each child table
+  per FK.
 
 No PRIMARY KEY or FOREIGN KEY constraints are declared: DuckDB enforces them,
 and RelBench data has dangling keys that preprocessing tolerates.
@@ -56,7 +63,27 @@ def load_parquet(con, table: str, path: Path, fkeys: list[str], index: bool) -> 
     return con.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
 
 
-def convert(db_dir: Path, out_dir: Path, *, index: bool, overwrite: bool) -> Path:
+FK_SCHEMA = '"__by_fk"'
+
+
+def fk_sorted_copy(con, table: str, key: str, col: str, time_col: str | None) -> None:
+    """A copy of `table` sorted by FK `col`, newest first within each value."""
+    columns = {r[0] for r in con.execute(f"DESCRIBE {table}").fetchall()}
+    if col not in columns:
+        return
+    order = [ident(col)]
+    if time_col and time_col in columns:
+        order.append(f"{ident(time_col)} DESC NULLS LAST")
+    order.append("__row DESC")
+    con.execute(
+        f"CREATE TABLE {FK_SCHEMA}.{ident(f'{key}:{col}')} AS "
+        f"SELECT * FROM {table} ORDER BY {', '.join(order)}"
+    )
+
+
+def convert(
+    db_dir: Path, out_dir: Path, *, index: bool, fk_sorted: bool, overwrite: bool
+) -> Path:
     manifest = yaml.safe_load((db_dir / "manifest.yaml").read_text())
     name = manifest["name"]
     out = out_dir / f"{name}.duckdb"
@@ -75,10 +102,14 @@ def convert(db_dir: Path, out_dir: Path, *, index: bool, overwrite: bool) -> Pat
         "INSERT INTO _rt_manifest VALUES ('db', ?, ?)", [name, json.dumps(manifest)]
     )
 
+    # (table SQL, key, FK columns, time column) of every table loaded
+    loaded: list[tuple[str, str, list[str], str | None]] = []
     specs = manifest.get("tables") or {}
     for path in sorted((db_dir / "db").glob("*.parquet")):
-        fkeys = list((specs.get(path.stem) or {}).get("fkeys") or {})
+        spec = specs.get(path.stem) or {}
+        fkeys = list(spec.get("fkeys") or {})
         n = load_parquet(con, ident(path.stem), path, fkeys, index)
+        loaded.append((ident(path.stem), path.stem, fkeys, spec.get("time_col")))
         print(f"  {name}: {path.stem} ({n:,} rows)", flush=True)
 
     for task_dir in sorted((db_dir / "tasks").glob("*")):
@@ -99,7 +130,20 @@ def convert(db_dir: Path, out_dir: Path, *, index: bool, overwrite: bool) -> Pat
         for path in sorted(task_dir.glob("*.parquet")):
             table = f"{ident(task_dir.name)}.{ident(path.stem)}"
             n = load_parquet(con, table, path, fkeys, index)
+            loaded.append(
+                (table, f"{task_dir.name}/{path.stem}", fkeys, tm.get("time_col"))
+            )
             print(f"  {name}: {task_dir.name}/{path.stem} ({n:,} rows)", flush=True)
+
+    if fk_sorted:
+        con.execute(f"CREATE SCHEMA {FK_SCHEMA}")
+        for table, key, fkeys, time_col in loaded:
+            for col in fkeys:
+                fk_sorted_copy(con, table, key, col, time_col)
+        n = con.execute(
+            "SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__by_fk'"
+        ).fetchone()[0]
+        print(f"  {name}: {n} FK-sorted copies", flush=True)
 
     con.close()
     tmp.replace(out)
@@ -115,6 +159,11 @@ def main() -> None:
     parser.add_argument(
         "--no-index", action="store_true", help="skip the __row and FK indexes"
     )
+    parser.add_argument(
+        "--fk-sorted",
+        action="store_true",
+        help="also write a copy of each table per FK, sorted by it, for children lookups",
+    )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
@@ -129,7 +178,11 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     for db_dir in db_dirs:
         out = convert(
-            db_dir, out_dir, index=not args.no_index, overwrite=args.overwrite
+            db_dir,
+            out_dir,
+            index=not args.no_index,
+            fk_sorted=args.fk_sorted,
+            overwrite=args.overwrite,
         )
         print(f"wrote {out} ({out.stat().st_size / 1e6:.1f} MB)", flush=True)
 

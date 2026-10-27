@@ -94,3 +94,9 @@ Database tables keep their names, and task splits become `"<task>".<split>`.
 Every table gains `__row`, its parquet row position, which is what RelBench
 keys refer to. `__row` and each foreign key column are indexed, and the
 manifests are stored in `_rt_manifest`. The script's docstring has the details.
+
+`--fk-sorted` also writes, for each table with foreign keys, one copy per FK
+sorted by it (`"__by_fk"."<table>:<fk>"`). `rt.sql` reads these for children
+lookups, which then skip the blocks of rows that cannot match instead of
+scanning the whole table. Contexts are unchanged; the file grows by about one
+copy of each child table per FK.

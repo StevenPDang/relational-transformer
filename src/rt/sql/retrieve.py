@@ -89,6 +89,18 @@ class Retriever:
         self.db = db
         self.enc = encoder
         self.cfg = config or RetrieveConfig()
+        # FK-sorted copies (`to_duckdb --fk-sorted`), keyed "<table key>:<fk>".
+        self.fk_sorted = {
+            name
+            for (name,) in con.execute(
+                "SELECT table_name FROM duckdb_tables() WHERE schema_name = '__by_fk'"
+            ).fetchall()
+        }
+
+    def _children_source(self, child: Table, col: str) -> str:
+        """The table to read `child`'s rows by FK `col` from: its sorted copy if any."""
+        name = f"{child.key}:{col}"
+        return f'"__by_fk".{ident(name)}' if name in self.fk_sorted else child.sql
 
     # -- queries ----------------------------------------------------------
 
@@ -399,7 +411,7 @@ class Retriever:
                     ctx,
                     f"children {child.key} via {col}",
                     f"SELECT {self.enc.select_list(child)}, {ident(col)} AS __parent, "
-                    f"w.__seed FROM {child.sql} "
+                    f"w.__seed FROM {self._children_source(child, col)} "
                     f"JOIN {_WANTED} w ON {ident(col)} = w.__pid WHERE {visible} "
                     f"QUALIFY row_number() OVER (PARTITION BY w.__seed, {ident(col)} "
                     f"ORDER BY {order}) <= {self.cfg.bfs_width} "
