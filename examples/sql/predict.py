@@ -127,6 +127,12 @@ def main():
         help="contexts retrieved at once, each on its own DuckDB cursor",
     )
     p.add_argument(
+        "--duckdb-threads",
+        type=int,
+        default=0,
+        help="threads DuckDB runs each query on (0: DuckDB's default, every core)",
+    )
+    p.add_argument(
         "--chunk", type=int, default=16, help="contexts built and predicted at once"
     )
     p.add_argument("--seed", type=int, default=0, help="seeds the row sample")
@@ -154,6 +160,13 @@ def main():
 
     tic = time.perf_counter()
     con = duckdb.connect(args.duckdb, read_only=True)
+    if args.duckdb_threads:
+        # Shared by every cursor: retrieval queries are small, and with several
+        # workers, each query spread over every core can cost more than it saves.
+        con.execute(f"SET threads = {int(args.duckdb_threads)}")
+    print(
+        f"duckdb threads {con.execute('SELECT current_setting(?)', ['threads']).fetchone()[0]}"
+    )
     if args.query_log:
         log_dir = str(Path(args.query_log).resolve()).replace("'", "''")
         con.execute(
