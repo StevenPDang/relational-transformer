@@ -55,6 +55,28 @@ _WANTED = (
 )
 
 
+class _Fetched:
+    """A fetched row not decoded yet: most rows a level fetches are never claimed.
+
+    `values` is the row as `select_list` returns it, and `via` is the reason
+    string, or for a child (FK column, parent table, parent row) to format
+    when it is claimed.
+    """
+
+    __slots__ = ("table", "values", "seed", "depth", "via")
+
+    def __init__(self, table: Table, values: tuple, seed: int, depth: int, via):
+        self.table = table
+        self.values = values
+        self.seed = seed
+        self.depth = depth
+        self.via = via
+
+    @property
+    def key(self) -> tuple[str, int]:
+        return (self.table.key, self.values[0])
+
+
 @dataclass
 class _SeedBfs:
     """One seed's breadth-first expansion, advanced a level at a time."""
@@ -62,7 +84,7 @@ class _SeedBfs:
     seed_i: int
     table: Table
     node: Node
-    level: list[Node] = field(default_factory=list)
+    level: list = field(default_factory=list)  # Nodes, or _Fetched rows to decode
     depth: int = 0
     cells: int = 0
     seen: set[tuple[str, int]] = field(default_factory=set)
@@ -125,6 +147,16 @@ class Retriever:
             if v is not None and not (isinstance(v, float) and math.isnan(v))
         ]
         return Node(t, row, parents, cells, ts, seed, depth, via)
+
+    def _decode(self, item: "Node | _Fetched") -> Node:
+        """The node of a level item, decoding a fetched row."""
+        if isinstance(item, Node):
+            return item
+        via = item.via
+        if isinstance(via, tuple):
+            col, parent_name, prow = via
+            via = f"child via {col} of {parent_name}/{prow}"
+        return self._node(item.table, item.values, item.seed, item.depth, via)
 
     def _visible(self, ts_sql: str | None, t: Table, bound, target_ts) -> str:
         """SQL predicate: row is not after `bound`, and is not a same-horizon task row."""
@@ -313,9 +345,12 @@ class Retriever:
         """
         st.frontier, st.wanted = [], []
         taken = claimed if claimed is not None else ()
-        for node in st.level:
-            if node.key in expanded or node.key in st.seen or node.key in taken:
+        for item in st.level:
+            key = item.key
+            if key in expanded or key in st.seen or key in taken:
                 continue
+            # Decoded only now: a row skipped above never is.
+            node = self._decode(item)
             st.cells += len(node.cells) + (1 if node is target else 0)
             if st.cells >= self.cfg.local_ctx_size and node is not st.node:
                 st.frontier, st.wanted, st.level = [], [], []
@@ -390,7 +425,7 @@ class Retriever:
                     v = fetched.get((name, r, st.seed_i))
                     if v is not None:
                         nodes.append(
-                            self._node(tables[name], v, st.seed_i, st.depth + 1, via)
+                            _Fetched(tables[name], v, st.seed_i, st.depth + 1, via)
                         )
         return out
 
@@ -449,12 +484,12 @@ class Retriever:
                 for child, col in self.db.children_of(parent_name):
                     for v in fetched.get((child.key, col, st.seed_i), []):
                         nodes.append(
-                            self._node(
+                            _Fetched(
                                 child,
                                 v[:-1],
                                 st.seed_i,
                                 st.depth + 1,
-                                f"child via {col} of {parent_name}/{v[-1]}",
+                                (col, parent_name, v[-1]),
                             )
                         )
         return out

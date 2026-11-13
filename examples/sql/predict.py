@@ -19,10 +19,11 @@ scored by RelBench itself (`relbench.submit.evaluate_task`), the same scoring
 
 import argparse
 import json
+import multiprocessing as mp
 import random
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 
 import duckdb
@@ -43,6 +44,25 @@ def score(task_type: str, labels, preds) -> str:
             return "AUROC n/a (one class)"
         return f"AUROC {roc_auc_score(labels > 0.5, preds):.4f}"
     return f"MAE {mean_absolute_error(labels, preds):.4f} (normalized units)"
+
+
+# A process worker's retriever, set up once by `_init_worker`.
+_WORKER: dict = {}
+
+
+def _init_worker(path: str, threads: int, config: "rs.RetrieveConfig") -> None:
+    """Open the database read-only in this worker process and build its retriever."""
+    con = duckdb.connect(path, read_only=True)
+    if threads:
+        con.execute(f"SET threads = {int(threads)}")
+    db = rs.load(con)
+    _WORKER["retriever"] = rs.Retriever(con, db, rs.Encoder(con, db), config)
+
+
+def _build_in_worker(task: str, split: str, row: int):
+    tic = time.perf_counter()
+    ctx = _WORKER["retriever"].build(task, split, row)
+    return ctx, time.perf_counter() - tic
 
 
 def predict(model, batch, ctx_size, bs, device):
@@ -125,12 +145,26 @@ def main():
         help="a fixed hop plan: expand each seed this many hops (default: until "
         "its local budget is full); use with a large --seed-batch",
     )
+    p.add_argument(
+        "--example-batch",
+        type=int,
+        default=64,
+        help="labelled seeds fetched per query; with --hops, match --seed-batch",
+    )
     p.add_argument("--bs", type=int, default=8)
     p.add_argument(
         "--workers",
         type=int,
         default=4,
-        help="contexts retrieved at once, each on its own DuckDB cursor",
+        help="contexts retrieved at once, each on its own DuckDB connection",
+    )
+    p.add_argument(
+        "--worker-type",
+        choices=("process", "thread"),
+        default="process",
+        help="process: each worker is a process with its own read-only connection, "
+        "so retrieval's Python runs in parallel; thread: threads sharing one "
+        "connection and one interpreter lock",
     )
     p.add_argument(
         "--duckdb-threads",
@@ -158,6 +192,10 @@ def main():
         "(tail -f <dir>/duckdb_log_entries.csv)",
     )
     args = p.parse_args()
+    if args.query_log and args.worker_type == "process":
+        raise SystemExit(
+            "--query-log logs one connection's queries: use it with --worker-type thread"
+        )
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise SystemExit("--device cuda, but torch.cuda.is_available() is False")
     print(
@@ -199,6 +237,7 @@ def main():
         local_ctx_size=args.local_ctx_size,
         bfs_width=args.bfs_width,
         seed_batch=args.seed_batch,
+        example_batch=args.example_batch,
         hops=args.hops,
     )
     # One retriever per worker thread, each on its own cursor: a DuckDB
@@ -224,16 +263,32 @@ def main():
     # In chunks: a full context batch holds two d_text vectors per token.
     # The next chunk is retrieved in the background while this one runs the model.
     chunks = [rows[i : i + args.chunk] for i in range(0, len(rows), args.chunk)]
-    pool = ThreadPoolExecutor(max_workers=args.workers)
+    if args.worker_type == "process":
+        # Spawned, not forked: the parent has torch (and maybe CUDA) loaded.
+        pool = ProcessPoolExecutor(
+            max_workers=args.workers,
+            mp_context=mp.get_context("spawn"),
+            initializer=_init_worker,
+            initargs=(args.duckdb, args.duckdb_threads, config),
+        )
+
+        def submit(r):
+            return pool.submit(_build_in_worker, args.task, args.split, r)
+    else:
+        pool = ThreadPoolExecutor(max_workers=args.workers)
+
+        def submit(r):
+            return pool.submit(build, r)
+
     t_start = time.perf_counter()
-    pending = [pool.submit(build, r) for r in chunks[0]] if chunks else []
+    pending = [submit(r) for r in chunks[0]] if chunks else []
     for k in range(len(chunks)):
         bar.set_postfix_str("retrieve")
         tic = time.perf_counter()
         built = [f.result() for f in pending]
         t_wait += time.perf_counter() - tic
         if k + 1 < len(chunks):
-            pending = [pool.submit(build, r) for r in chunks[k + 1]]
+            pending = [submit(r) for r in chunks[k + 1]]
         contexts = [c for c, _ in built]
         t_retrieve += sum(dt for _, dt in built)
         bar.set_postfix_str("encode")
@@ -289,7 +344,8 @@ def main():
     print(f"  encode   {t_encode / n * 1e3:.1f} ms/context (incl. text embedding)")
     print(f"  model    {t_model / n * 1e3:.1f} ms/context ({args.device})")
     print(
-        f"  wall     {t_wall / n * 1e3:.1f} ms/context with {args.workers} workers "
+        f"  wall     {t_wall / n * 1e3:.1f} ms/context with {args.workers} "
+        f"{args.worker_type} workers "
         f"({t_wait / n * 1e3:.1f} ms/context waiting on retrieval)"
     )
     if args.trace:
