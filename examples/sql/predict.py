@@ -119,6 +119,12 @@ def main():
         default=1,
         help="seeds expanded together, one query per BFS step for the batch",
     )
+    p.add_argument(
+        "--hops",
+        type=int,
+        help="a fixed hop plan: expand each seed this many hops (default: until "
+        "its local budget is full); use with a large --seed-batch",
+    )
     p.add_argument("--bs", type=int, default=8)
     p.add_argument(
         "--workers",
@@ -193,6 +199,7 @@ def main():
         local_ctx_size=args.local_ctx_size,
         bfs_width=args.bfs_width,
         seed_batch=args.seed_batch,
+        hops=args.hops,
     )
     # One retriever per worker thread, each on its own cursor: a DuckDB
     # connection runs one query at a time, and contexts are independent.

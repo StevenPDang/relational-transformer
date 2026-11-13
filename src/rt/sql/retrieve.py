@@ -42,6 +42,10 @@ class RetrieveConfig:
     bfs_width: int = 16
     example_batch: int = 64  # labelled seeds fetched per query
     seed_batch: int = 1  # seeds expanded together, one query per BFS step
+    # A fixed hop plan: expand each seed exactly this many hops (None: until
+    # its local budget is full). Seeds of a batch then claim rows in seed
+    # order, so a row is fetched for one seed, not once per seed.
+    hops: int | None = None
 
 
 # Each wanted row with its seed's time bound and index, one parameter array each.
@@ -278,9 +282,16 @@ class Retriever:
         states = [_SeedBfs(seed_i, t, node) for seed_i, t, node in seeds]
         for st in states:
             st.node.seed = st.seed_i
+        hops = self.cfg.hops
+        # With a hop plan, rows the batch's earlier seeds claimed (on this level
+        # or before) are skipped, as rows of earlier batches are.
+        claimed: set | None = None if hops is None else set()
         while any(st.level for st in states):
             for st in states:
-                self._take_level(st, target, expanded)
+                self._take_level(st, target, expanded, claimed)
+            # Every seed of a batch is on the same level.
+            if hops is not None and states[0].depth >= hops:
+                break
             parents = self._fetch_parents(ctx, states)
             children = self._fetch_children(ctx, states, target_ts)
             for st in states:
@@ -294,24 +305,32 @@ class Retriever:
                 if len(ctx.tokens) >= self.cfg.ctx_size:
                     return
 
-    def _take_level(self, st: "_SeedBfs", target: Node, expanded) -> None:
-        """Claim this seed's rows on its current level, until its local budget is spent."""
+    def _take_level(self, st: "_SeedBfs", target: Node, expanded, claimed=None) -> None:
+        """Claim this seed's rows on its current level, until its local budget is spent.
+
+        `claimed`, with a hop plan, holds the rows earlier seeds of the batch
+        took; they are skipped too, and this seed's rows are added to it.
+        """
         st.frontier, st.wanted = [], []
+        taken = claimed if claimed is not None else ()
         for node in st.level:
-            if node.key in expanded or node.key in st.seen:
+            if node.key in expanded or node.key in st.seen or node.key in taken:
                 continue
             st.cells += len(node.cells) + (1 if node is target else 0)
             if st.cells >= self.cfg.local_ctx_size and node is not st.node:
                 st.frontier, st.wanted, st.level = [], [], []
                 return
             st.seen.add(node.key)
+            if claimed is not None:
+                claimed.add(node.key)
             st.collected.append(node)
             st.frontier.append(node)
             for (ptable, prow), col in zip(
                 node.parents, self.enc.tables[node.table.key].fk_columns
             ):
                 # Already claimed: the next level would skip it, so don't fetch it.
-                if (ptable, prow) in expanded or (ptable, prow) in st.seen:
+                key = (ptable, prow)
+                if key in expanded or key in st.seen or key in taken:
                     continue
                 st.wanted.append(
                     (
